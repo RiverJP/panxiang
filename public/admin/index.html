@@ -32,12 +32,12 @@
 
       <section class="admin-content section active" id="section-products">
         <div class="page-heading">
-          <div><p class="kicker">PRODUCT OPERATIONS</p><h1>印尼通信商品</h1><p>这里只同步并管理印尼话费充值和流量套餐，非通信商品会被自动排除。</p></div>
+          <div><p class="kicker">PRODUCT OPERATIONS</p><h1>ReloadN 全部 SKU</h1><p>同步供应商返回的完整商品目录；你可以补充运营商与分类，再选择需要在前台销售的套餐。</p></div>
           <div class="heading-actions"><button class="button secondary" id="refreshFx">刷新汇率</button><button class="button primary" id="syncProducts">同步 ReloadN SKU</button></div>
         </div>
 
         <div class="stats-grid">
-          <article class="stat-card"><span>通信 SKU</span><strong id="statProducts">—</strong><small>话费及流量套餐</small></article>
+          <article class="stat-card"><span>全部 SKU</span><strong id="statProducts">—</strong><small>供应商完整目录</small></article>
           <article class="stat-card"><span>已上架</span><strong id="statPublished">—</strong><small>前台当前可购买</small></article>
           <article class="stat-card"><span>供应商不可用</span><strong id="statUnavailable">—</strong><small>已自动停止前台销售</small></article>
           <article class="stat-card"><span>IDR / CNY</span><strong id="statRate">—</strong><small id="statRateTime">等待汇率更新</small></article>
@@ -46,12 +46,12 @@
         <section class="admin-panel">
           <div class="product-toolbar">
             <label class="search-box"><span>⌕</span><input id="productSearch" placeholder="搜索 SKU、名称、描述或运营商"></label>
-            <select id="categoryFilter"><option value="all">全部类型</option><option value="airtime">话费充值</option><option value="data">流量套餐</option></select>
+            <select id="categoryFilter"><option value="all">全部类型</option><option value="airtime">话费充值</option><option value="data">流量套餐</option><option value="unclassified">待分类 / 其他</option></select>
             <select id="operatorFilter"><option value="all">全部运营商</option></select>
             <select id="publishFilter"><option value="all">全部上架状态</option><option value="published">已上架</option><option value="hidden">未上架</option><option value="unavailable">供应商不可用</option></select>
           </div>
           <div class="bulk-bar">
-            <label><input type="checkbox" id="selectAll"> 选择当前结果</label>
+            <label><input type="checkbox" id="selectAll"> 选择当前页</label>
             <span id="selectedCount">已选择 0 项</span>
             <button class="mini-button" id="bulkPublish">批量上架</button>
             <button class="mini-button danger" id="bulkUnpublish">批量下架</button>
@@ -63,7 +63,7 @@
               <tbody id="productRows"><tr><td colspan="9" class="empty-state">正在加载商品…</td></tr></tbody>
             </table>
           </div>
-          <div class="panel-footer"><span id="productResultCount">0 个结果</span><span>供应商下架商品会被保留记录并自动停止销售</span></div>
+          <div class="panel-footer"><span id="productResultCount">0 个结果</span><div class="pagination"><button class="mini-button" id="productPrev">上一页</button><span id="productPageInfo">第 1 / 1 页</span><button class="mini-button" id="productNext">下一页</button></div><span>全部 SKU 都会保留；只有完成分类、运营商和必要人工确认的商品才能上架</span></div>
         </section>
       </section>
 
@@ -91,8 +91,8 @@
             <dl class="detail-list"><div><dt>当前来源</dt><dd id="fxSource">—</dd></div><div><dt>更新时间</dt><dd id="fxUpdated">—</dd></div><div><dt>自动刷新</dt><dd>每 8 小时</dd></div></dl>
           </section>
           <section class="admin-panel settings-card">
-            <div class="card-title"><div><h2>供应商同步</h2><p>每天检查一次完整商品目录并跟随分页游标。</p></div><span class="status-badge success">已启用</span></div>
-            <dl class="detail-list"><div><dt>最近完成</dt><dd id="syncCompleted">—</dd></div><div><dt>供应商返回</dt><dd id="syncSupplierCount">—</dd></div><div><dt>纳入通信商品</dt><dd id="syncEligibleCount">—</dd></div><div><dt>自动同步</dt><dd>每 24 小时</dd></div></dl>
+            <div class="card-title"><div><h2>供应商同步</h2><p>每天检查一次完整 SKU 目录并跟随分页游标。</p></div><span class="status-badge success">已启用</span></div>
+            <dl class="detail-list"><div><dt>最近完成</dt><dd id="syncCompleted">—</dd></div><div><dt>全部 SKU</dt><dd id="syncSupplierCount">—</dd></div><div><dt>自动识别通信套餐</dt><dd id="syncEligibleCount">—</dd></div><div><dt>自动同步</dt><dd>每 24 小时</dd></div></dl>
           </section>
         </div>
         <section class="admin-panel audit-panel"><div class="card-title"><div><h2>最近操作</h2><p>保留最近 1,000 条商品、汇率及同步操作记录。</p></div></div><div id="auditList" class="audit-list"><div class="empty-state">正在加载记录…</div></div></section>

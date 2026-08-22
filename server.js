@@ -277,6 +277,12 @@ function inferSupplierOperator(item) {
     || "";
 }
 
+function supplierOperatorLabel(item) {
+  return inferSupplierOperator(item)
+    || String(item.operator || item.telco || item.provider || item.brand || item.network || "").trim()
+    || "未知运营商";
+}
+
 function inferSupplierCategory(item, operator) {
   if (!operator) return "unclassified";
   const text = productText(item);
@@ -296,6 +302,10 @@ function indonesiaCountryMatches(item, operator) {
     .map((value) => String(value).trim());
   if (!values.length) return Boolean(operator);
   return values.some((value) => /^(ID|IDN|360|62|\+62)$/i.test(value) || /indonesia/i.test(value));
+}
+
+function supplierCountryLabel(item) {
+  return String(item.country_code || item.countryCode || item.country || item.iso_country || item.isoCountry || "").trim();
 }
 
 function numericIdr(value) {
@@ -338,43 +348,56 @@ function supplierBuyPriceIdr(item) {
     ?? (typeof item.price === "object" ? null : item.price));
 }
 
-function supplierProductActive(item) {
+function supplierProductAvailability(item) {
   const unavailable = new Set([
     "0", "false", "no", "off", "inactive", "disabled", "offline", "suspended", "unavailable",
     "maintenance", "maintaining", "out_of_stock", "out-of-stock", "out of stock", "sold_out", "sold-out", "sold out", "closed"
   ]);
-  const available = new Set(["1", "true", "yes", "on", "active", "enabled", "online", "available", "ready", "live", "open", "in_stock", "in-stock", "in stock"]);
-  const candidates = [item.active, item.enabled, item.available, item.status, item.state, item.product_status, item.productStatus, item.availability]
+  const available = new Set(["1", "true", "yes", "on", "active", "enabled", "online", "available", "ready", "live", "open", "normal", "in_stock", "in-stock", "in stock"]);
+  const candidates = [item.active, item.is_active, item.isActive, item.enabled, item.is_enabled, item.isEnabled, item.available, item.is_available, item.isAvailable, item.status, item.state, item.product_status, item.productStatus, item.availability]
     .filter((value) => value !== null && value !== undefined && value !== "")
     .map((value) => String(value).trim().toLowerCase());
-  if (!candidates.length || candidates.some((value) => unavailable.has(value))) return false;
-  return candidates.every((value) => available.has(value));
+  if (!candidates.length) return { active: false, statusKnown: false, unavailableReason: "供应商未返回可用状态" };
+  if (candidates.some((value) => unavailable.has(value))) return { active: false, statusKnown: true, unavailableReason: "供应商标记为不可用" };
+  if (candidates.some((value) => available.has(value))) return { active: true, statusKnown: true, unavailableReason: "" };
+  return { active: false, statusKnown: false, unavailableReason: `未识别供应状态：${candidates[0]}` };
 }
 
 function normalizeSupplierProduct(item) {
   const sku = String(item.sku || item.code || item.product_code || item.id || "").trim();
-  const operator = inferSupplierOperator(item);
-  const category = inferSupplierCategory(item, operator);
+  const inferredOperator = inferSupplierOperator(item);
+  const operator = supplierOperatorLabel(item);
+  const category = inferSupplierCategory(item, inferredOperator);
   const text = productText(item);
-  const countryOk = indonesiaCountryMatches(item, operator);
+  const countryOk = indonesiaCountryMatches(item, inferredOperator);
   const blocked = blockedProductPattern.test(text);
   const buyPriceIdr = supplierBuyPriceIdr(item);
-  const active = supplierProductActive(item);
-  const eligible = Boolean(sku && countryOk && operator && ["airtime", "data"].includes(category) && !blocked);
+  const availability = supplierProductAvailability(item);
+  const sourceEligible = Boolean(sku && countryOk && inferredOperator && ["airtime", "data"].includes(category) && !blocked);
   const name = String(item.name || item.title || item.product_name || sku);
   return {
     sku,
-    countryCode: "ID",
+    countryCode: countryOk ? "ID" : "",
+    sourceCountry: supplierCountryLabel(item),
     operator,
     category,
     kind: category === "airtime" ? "话费" : category === "data" ? "流量" : "待分类",
     name,
     buyPriceIdr,
-    active,
-    eligible,
-    excludeReason: eligible ? "" : !countryOk ? "非印尼商品" : !operator ? "无法识别印尼运营商" : blocked ? "非通信充值商品" : "无法识别为话费或流量套餐",
+    active: availability.active,
+    statusKnown: availability.statusKnown,
+    unavailableReason: availability.unavailableReason,
+    sourceEligible,
+    excludeReason: sourceEligible ? "" : !countryOk ? "未自动识别为印尼商品" : !inferredOperator ? "未自动识别运营商" : blocked ? "非通信充值商品" : "未自动识别为话费或流量套餐",
     raw: item
   };
+}
+
+function productCanAppearInCatalog(product) {
+  return ["airtime", "data"].includes(String(product?.category || ""))
+    && Boolean(String(product?.operator || "").trim())
+    && String(product?.operator || "").trim() !== "未知运营商"
+    && ((product?.sourceEligible ?? product?.eligible) === true || product?.manualCatalogApproved === true);
 }
 
 function getAutoPriceCny(product, fx) {
@@ -396,6 +419,11 @@ function getSellPriceCny(product, fx) {
     return Number.isFinite(manualPrice) && manualPrice > 0 ? manualPrice : null;
   }
   return getAutoPriceCny(product, fx);
+}
+
+function adminProductView(product, fx) {
+  const { raw: _raw, ...view } = product;
+  return { ...view, autoPriceCny: getAutoPriceCny(product, fx) };
 }
 
 async function refreshFxRate(source = "manual") {
@@ -423,26 +451,50 @@ async function syncSupplierCatalog(source = "manual") {
     if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) throw new Error("供应商 API 未配置");
     const response = await listAllSupplierProducts();
     const old = await readJson(productsFile, []);
+    const previousMeta = await readJson(syncMetaFile, null);
     const oldBySku = new Map(old.map((product) => [product.sku, product]));
     const now = new Date().toISOString();
-    const normalized = response.items.map(normalizeSupplierProduct);
-    const eligible = normalized.filter((product) => product.eligible);
-    const returnedBySku = new Map(normalized.filter((product) => product.sku).map((product) => [product.sku, product]));
-    const previousEligible = old.filter((product) => product.eligible !== false && product.active !== false);
+    const normalized = response.items.map(normalizeSupplierProduct).filter((product) => product.sku);
+    const sourceEligible = normalized.filter((product) => product.sourceEligible);
+    const previousEligible = old.filter((product) => (product.sourceEligible ?? product.eligible) === true && product.active !== false);
     const minimumRetentionRatio = Number(process.env.CATALOG_MIN_RETENTION_RATIO || 0.25);
-    if (!eligible.length) throw new Error("本次同步未识别出话费或流量套餐，已保留现有商品数据");
-    if (response.complete && previousEligible.length >= 20 && eligible.length / previousEligible.length < minimumRetentionRatio) {
-      throw new Error(`本次通信商品数量异常下降（${previousEligible.length} → ${eligible.length}），已取消同步`);
+    if (!normalized.length) throw new Error("供应商未返回有效 SKU，已保留现有商品数据");
+    if (response.complete && previousEligible.length >= 20 && sourceEligible.length / previousEligible.length < minimumRetentionRatio) {
+      throw new Error(`本次自动识别通信商品数量异常下降（${previousEligible.length} → ${sourceEligible.length}），已取消同步`);
     }
-    const seen = new Set(eligible.map((product) => product.sku));
-    const products = eligible.map((fresh) => {
+    const currentQueryTypes = [...response.types].map(String).sort();
+    const previousQueryTypes = Array.isArray(previousMeta?.queriedTypes) ? [...previousMeta.queriedTypes].map(String).sort() : [];
+    const sameQueryScope = previousQueryTypes.length === currentQueryTypes.length
+      && previousQueryTypes.every((type, index) => type === currentQueryTypes[index]);
+    const canRetireMissing = Boolean(response.complete && sameQueryScope);
+    const seen = new Set(normalized.map((product) => product.sku));
+    const products = normalized.map((fresh) => {
       const previous = oldBySku.get(fresh.sku) || {};
+      const category = previous.categoryManual ? previous.category : fresh.category;
+      const operator = previous.operatorManual ? previous.operator : fresh.operator;
+      const manualCatalogApproved = Boolean(previous.manualCatalogApproved);
+      const catalogEligible = ["airtime", "data"].includes(category)
+        && Boolean(operator)
+        && operator !== "未知运营商"
+        && (fresh.sourceEligible || manualCatalogApproved);
       return {
         ...fresh,
-        description: previous.description || fresh.name,
+        supplierName: fresh.name,
+        sourceQueryTypes: response.types,
+        name: previous.sku ? (previous.name || fresh.name) : fresh.name,
+        category,
+        operator,
+        kind: category === "airtime" ? "话费" : category === "data" ? "流量" : "待分类",
+        eligible: fresh.sourceEligible,
+        catalogReady: catalogEligible,
+        nameManual: Boolean(previous.nameManual),
+        categoryManual: Boolean(previous.categoryManual),
+        operatorManual: Boolean(previous.operatorManual),
+        manualCatalogApproved,
+        description: Object.hasOwn(previous, "description") ? previous.description : fresh.name,
         priceMode: previous.priceMode === "manual" ? "manual" : "auto",
         ...(previous.priceCny !== undefined ? { priceCny: previous.priceCny } : {}),
-        published: Boolean(previous.published && fresh.active),
+        published: Boolean(previous.published && fresh.active && catalogEligible),
         popular: Boolean(previous.popular),
         sortOrder: Number.isFinite(Number(previous.sortOrder)) ? Number(previous.sortOrder) : 0,
         firstSeenAt: previous.firstSeenAt || now,
@@ -452,16 +504,11 @@ async function syncSupplierCatalog(source = "manual") {
     });
     for (const previous of old) {
       if (seen.has(previous.sku)) continue;
-      const returned = returnedBySku.get(previous.sku);
-      if (returned) {
-        products.push({ ...previous, active: false, published: false, unavailableReason: returned.excludeReason || "供应商商品不再符合通信套餐规则", syncedAt: now });
-      } else {
-        products.push(response.complete
-          ? { ...previous, active: false, published: false, unavailableReason: "供应商完整目录未返回该商品", syncedAt: now }
-          : { ...previous });
-      }
+      products.push(canRetireMissing
+        ? { ...previous, active: false, published: false, unavailableReason: "供应商完整目录未返回该商品", syncedAt: now }
+        : { ...previous });
     }
-    products.sort((left, right) => left.operator.localeCompare(right.operator) || left.category.localeCompare(right.category) || left.sku.localeCompare(right.sku));
+    products.sort((left, right) => String(left.operator || "").localeCompare(String(right.operator || "")) || String(left.category || "").localeCompare(String(right.category || "")) || String(left.sku || "").localeCompare(String(right.sku || "")));
     const meta = {
       source,
       startedAt: now,
@@ -469,10 +516,12 @@ async function syncSupplierCatalog(source = "manual") {
       pages: response.pages,
       queriedTypes: response.types,
       catalogComplete: Boolean(response.complete),
+      queryScopeMatchesPrevious: sameQueryScope,
+      missingProductsRetired: canRetireMissing,
       pagination: response.pagination,
-      supplierCount: response.items.length,
-      eligibleCount: eligible.length,
-      excludedCount: normalized.length - eligible.length,
+      supplierCount: normalized.length,
+      eligibleCount: sourceEligible.length,
+      excludedCount: normalized.length - sourceEligible.length,
       unavailableCount: products.filter((product) => !product.active).length
     };
     await writeJson(productsFile, products);
@@ -653,7 +702,7 @@ async function adminApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/admin/products") {
     const products = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    return json(res, 200, { ok: true, products: products.map((product) => ({ ...product, autoPriceCny: getAutoPriceCny(product, fx) })) });
+    return json(res, 200, { ok: true, products: products.map((product) => adminProductView(product, fx)) });
   }
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync") {
     try {
@@ -674,7 +723,7 @@ async function adminApi(req, res, url) {
       let changed = 0;
       for (const product of products) {
         if (!skuSet.has(product.sku)) continue;
-        if (input.published && (!product.active || getSellPriceCny(product, fx) === null)) continue;
+        if (input.published && (!product.active || !productCanAppearInCatalog(product) || getSellPriceCny(product, fx) === null)) continue;
         product.published = input.published;
         changed += 1;
       }
@@ -690,11 +739,23 @@ async function adminApi(req, res, url) {
       const products = await readJson(productsFile, []);
       const product = products.find((p) => p.sku === sku);
       if (!product) return json(res, 404, { ok: false, message: "SKU不存在" });
-      if (typeof input.published === "boolean") {
-        if (input.published && !product.active) return json(res, 400, { ok: false, message: "供应商已停用该商品，不能上架" });
-        product.published = input.published;
+      const requestedPublished = typeof input.published === "boolean" ? input.published : product.published;
+      if (typeof input.category === "string") {
+        if (!["airtime", "data", "unclassified"].includes(input.category)) return json(res, 400, { ok: false, message: "商品分类无效" });
+        product.category = input.category;
+        product.categoryManual = true;
+        product.kind = input.category === "airtime" ? "话费" : input.category === "data" ? "流量" : "待分类";
       }
-      if (typeof input.name === "string" && input.name.trim()) product.name = input.name.trim().slice(0, 120);
+      if (typeof input.operator === "string") {
+        product.operator = input.operator.trim().slice(0, 80) || "未知运营商";
+        product.operatorManual = true;
+      }
+      if (typeof input.manualCatalogApproved === "boolean") product.manualCatalogApproved = input.manualCatalogApproved;
+      product.catalogReady = productCanAppearInCatalog(product);
+      if (typeof input.name === "string" && input.name.trim()) {
+        product.name = input.name.trim().slice(0, 120);
+        product.nameManual = true;
+      }
       if (typeof input.description === "string") product.description = input.description.slice(0, 500);
       if (typeof input.popular === "boolean") product.popular = input.popular;
       if (input.sortOrder !== undefined) {
@@ -708,10 +769,13 @@ async function adminApi(req, res, url) {
         if (input.priceCny === "" || !Number.isFinite(manualPrice) || manualPrice <= 0) return json(res, 400, { ok: false, message: "请输入有效的手动售价" });
         product.priceCny = manualPrice;
       }
-      if (product.published && getSellPriceCny(product, await readJson(fxFile, null)) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      if (requestedPublished && !product.active) return json(res, 400, { ok: false, message: "供应商已停用该商品，不能上架" });
+      if (requestedPublished && !productCanAppearInCatalog(product)) return json(res, 400, { ok: false, message: "请先确认商品是印尼通信套餐，并完成分类和运营商设置" });
+      if (requestedPublished && getSellPriceCny(product, await readJson(fxFile, null)) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      product.published = requestedPublished;
       await writeJson(productsFile, products);
       await appendAudit("product.update", { sku, published: product.published, priceMode: product.priceMode, popular: product.popular, sortOrder: product.sortOrder });
-      return json(res, 200, { ok: true, product });
+      return json(res, 200, { ok: true, product: adminProductView(product, await readJson(fxFile, null)) });
     });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/fx") return json(res, 200, { ok: true, fx: await readJson(fxFile, null) });
@@ -805,7 +869,7 @@ async function handleApi(req, res, url) {
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
     const published = managed
-      .filter((product) => product.published && product.active && product.eligible !== false)
+      .filter((product) => product.published && product.active && productCanAppearInCatalog(product))
       .map((product) => ({
         id: product.sku,
         operator: product.operator,
@@ -838,12 +902,13 @@ async function handleApi(req, res, url) {
     try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    const managedItem = managed.find((product) => product.sku === input.productId && product.published && product.active && product.eligible !== false);
+    const managedItem = managed.find((product) => product.sku === input.productId && product.published && product.active && productCanAppearInCatalog(product));
     const demoProduct = process.env.NODE_ENV !== "production" && managed.length === 0 ? findProduct(input.productId) : null;
     const product = managedItem ? { ...managedItem, id: managedItem.sku, label: managedItem.name || managedItem.sku, price: getSellPriceCny(managedItem, fx), currency: "CNY" } : demoProduct;
     const phone = normalizePhone(input.phone);
     const detectedOperator = detectOperator(phone);
     if (!product) return json(res, 400, { ok: false, message: "套餐不存在" });
+    if (!Number.isFinite(Number(product.price)) || Number(product.price) <= 0) return json(res, 409, { ok: false, message: "套餐当前售价不可用，请稍后刷新重试" });
     if (!validPhone(phone)) return json(res, 400, { ok: false, message: "请输入有效的印尼手机号，例如 +62812xxxxxxx 或 0812xxxxxxx" });
     if (detectedOperator && detectedOperator !== product.operator) return json(res, 400, { ok: false, message: `该手机号段识别为 ${detectedOperator}，请选择对应套餐` });
     const id = `PX${Date.now()}${crypto.randomBytes(3).toString("hex")}`;

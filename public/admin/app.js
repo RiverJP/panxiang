@@ -5,6 +5,8 @@ const state = {
   products: [],
   orders: [],
   selectedSkus: new Set(),
+  productPage: 1,
+  productPageSize: 100,
   section: "products",
   fx: null,
   status: null
@@ -96,23 +98,28 @@ function currentFilteredProducts() {
   });
 }
 
-function categoryLabel(category) {
-  return category === "airtime" ? "话费充值" : category === "data" ? "流量套餐" : "待分类";
+function pagedProducts(filtered = currentFilteredProducts()) {
+  const totalPages = Math.max(1, Math.ceil(filtered.length / state.productPageSize));
+  state.productPage = Math.max(1, Math.min(state.productPage, totalPages));
+  const start = (state.productPage - 1) * state.productPageSize;
+  return { items: filtered.slice(start, start + state.productPageSize), totalPages };
 }
 
 function productRow(product) {
   const active = product.active !== false;
+  const sourceEligible = (product.sourceEligible ?? product.eligible) === true;
   const automatic = product.priceMode !== "manual";
   const price = automatic ? product.autoPriceCny : product.priceCny;
+  const missingCost = product.buyPriceIdr == null;
   const checked = state.selectedSkus.has(String(product.sku));
   return `<tr data-sku="${escapeHtml(product.sku)}">
     <td><input class="row-select" type="checkbox" aria-label="选择 ${escapeHtml(product.sku)}" ${checked ? "checked" : ""}></td>
     <td><div class="sku-title">${escapeHtml(product.name || product.sku)}</div><div class="subline">${escapeHtml(product.sku)} · ${escapeHtml(product.operator || "未知运营商")}</div></td>
-    <td><span class="category-badge ${escapeHtml(product.category || "")}">${escapeHtml(categoryLabel(product.category))}</span><span class="state-badge ${active ? "" : "offline"}">${active ? "供应正常" : "供应不可用"}</span>${product.unavailableReason ? `<div class="subline">${escapeHtml(product.unavailableReason)}</div>` : ""}</td>
+    <td><select class="table-select product-category" aria-label="商品分类"><option value="unclassified" ${!["airtime", "data"].includes(product.category) ? "selected" : ""}>待分类 / 其他</option><option value="airtime" ${product.category === "airtime" ? "selected" : ""}>话费充值</option><option value="data" ${product.category === "data" ? "selected" : ""}>流量套餐</option></select><br><input class="table-input operator-input product-operator" maxlength="80" value="${escapeHtml(product.operator || "")}" placeholder="运营商" aria-label="运营商"><br><span class="state-badge ${active ? "" : "offline"}">${active ? "供应正常" : "供应不可用"}</span>${product.excludeReason ? `<div class="subline">${escapeHtml(product.excludeReason)}</div>` : ""}${product.unavailableReason ? `<div class="subline">${escapeHtml(product.unavailableReason)}</div>` : ""}</td>
     <td><div class="cost">${product.buyPriceIdr == null ? "—" : Number(product.buyPriceIdr).toLocaleString("zh-CN")}</div><div class="subline">IDR</div></td>
     <td><input class="table-input name-input product-name" maxlength="120" value="${escapeHtml(product.name || product.sku)}" aria-label="前台名称"><br><input class="table-input description-input product-description" maxlength="500" value="${escapeHtml(product.description || "")}" placeholder="套餐说明" aria-label="套餐说明"></td>
-    <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? "汇率未就绪" : "售价"}"><div class="subline">人民币</div></td>
-    <td><input class="table-input sort-input product-sort" type="number" min="-9999" max="9999" step="1" value="${escapeHtml(product.sortOrder ?? 0)}" aria-label="排序"><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label></td>
+    <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? (missingCost ? "缺少买入价" : "汇率未就绪") : "售价"}"><div class="subline">${automatic && missingCost ? "可切换手动定价" : "人民币"}</div></td>
+    <td><input class="table-input sort-input product-sort" type="number" min="-9999" max="9999" step="1" value="${escapeHtml(product.sortOrder ?? 0)}" aria-label="排序"><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label><label class="display-controls approval-control"><input class="product-manual-approval" type="checkbox" ${sourceEligible || product.manualCatalogApproved ? "checked" : ""} ${sourceEligible ? "disabled" : ""}> ${sourceEligible ? "系统已识别" : "确认是印尼通信套餐"}</label></td>
     <td><label class="switch" title="${active ? "设置上架状态" : "供应商不可用，无法上架"}"><input class="product-published" type="checkbox" ${product.published ? "checked" : ""} ${active ? "" : "disabled"}><span class="slider"></span></label></td>
     <td><button class="save-button save-product">保存</button></td>
   </tr>`;
@@ -131,14 +138,19 @@ function updateSelectionSummary(filtered = currentFilteredProducts()) {
 }
 
 function renderProducts() {
-  const products = currentFilteredProducts();
+  const filtered = currentFilteredProducts();
+  const page = pagedProducts(filtered);
+  const products = page.items;
   $("#statProducts").textContent = state.products.length.toLocaleString("zh-CN");
   $("#statPublished").textContent = state.products.filter((product) => product.published && product.active !== false).length.toLocaleString("zh-CN");
   $("#statUnavailable").textContent = state.products.filter((product) => product.active === false).length.toLocaleString("zh-CN");
-  $("#productResultCount").textContent = `${products.length.toLocaleString("zh-CN")} 个结果`;
+  $("#productResultCount").textContent = `${filtered.length.toLocaleString("zh-CN")} 个结果，每页最多 ${state.productPageSize} 个`;
+  $("#productPageInfo").textContent = `第 ${state.productPage} / ${page.totalPages} 页`;
+  $("#productPrev").disabled = state.productPage <= 1;
+  $("#productNext").disabled = state.productPage >= page.totalPages;
   $("#productRows").innerHTML = products.length
     ? products.map(productRow).join("")
-    : '<tr><td colspan="9" class="empty-state">没有符合当前筛选条件的通信商品</td></tr>';
+    : '<tr><td colspan="9" class="empty-state">没有符合当前筛选条件的 SKU</td></tr>';
 
   $$(".row-select", $("#productRows")).forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
@@ -159,7 +171,7 @@ function onPriceModeChange(event) {
   const automatic = event.currentTarget.value === "auto";
   input.readOnly = automatic;
   input.value = automatic ? (product?.autoPriceCny == null ? "" : Number(product.autoPriceCny).toFixed(2)) : (product?.priceCny ?? product?.autoPriceCny ?? "");
-  input.placeholder = automatic && !input.value ? "汇率未就绪" : "售价";
+  input.placeholder = automatic && !input.value ? (product?.buyPriceIdr == null ? "缺少买入价" : "汇率未就绪") : "售价";
   if (!automatic) input.focus();
 }
 
@@ -167,17 +179,26 @@ async function saveProduct(event) {
   const button = event.currentTarget;
   const row = button.closest("tr");
   const sku = row.dataset.sku;
+  const product = state.products.find((item) => String(item.sku) === sku);
   const priceMode = $(".price-mode", row).value;
   const priceInput = $(".product-price", row);
+  const approvalInput = $(".product-manual-approval", row);
+  const sourceEligible = (product?.sourceEligible ?? product?.eligible) === true;
   const payload = {
     name: $(".product-name", row).value.trim(),
     description: $(".product-description", row).value.trim(),
+    category: $(".product-category", row).value,
+    operator: $(".product-operator", row).value.trim(),
     priceMode,
     popular: $(".product-popular", row).checked,
+    manualCatalogApproved: sourceEligible ? Boolean(product?.manualCatalogApproved) : approvalInput.checked,
     sortOrder: Number($(".product-sort", row).value || 0),
     published: $(".product-published", row).checked
   };
   if (!payload.name) return notify("前台商品名称不能为空", "error");
+  if (payload.published && !["airtime", "data"].includes(payload.category)) return notify("上架前请先选择话费或流量分类", "error");
+  if (payload.published && (!payload.operator || payload.operator === "未知运营商")) return notify("上架前请填写运营商", "error");
+  if (payload.published && !sourceEligible && !payload.manualCatalogApproved) return notify("该 SKU 未被系统识别为印尼通信套餐，请人工核对后勾选确认", "error");
   if (priceMode === "manual") {
     payload.priceCny = Number(priceInput.value);
     if (!Number.isFinite(payload.priceCny) || payload.priceCny <= 0) return notify("请输入有效的手动售价", "error");
@@ -222,12 +243,18 @@ async function loadFx() {
 
 async function runProductSync() {
   const button = $("#syncProducts");
-  if (!window.confirm("确定从 ReloadN 拉取完整话费和流量商品目录吗？现有前台文案及定价设置会保留。")) return;
+  if (!window.confirm("确定从 ReloadN 拉取全部 SKU 吗？未知运营商或类型的商品也会进入后台，但不会自动上架；现有人工设置会保留。")) return;
   setButtonBusy(button, true, "同步中…");
   try {
     const result = await api("/api/admin/products/sync", { method: "POST", body: "{}" });
-    notify(`同步完成，共保留 ${Number(result.count || 0).toLocaleString("zh-CN")} 个通信 SKU`);
+    const completeness = !result.meta?.catalogComplete
+      ? "供应商未提供完整性确认，旧 SKU 已安全保留"
+      : result.meta?.missingProductsRetired
+        ? "已确认当前查询范围的完整目录"
+        : "已拉完当前查询范围；因查询范围首次启用或有变化，旧 SKU 暂保留一轮";
+    notify(`同步完成，共保留 ${Number(result.count || 0).toLocaleString("zh-CN")} 个 SKU；${completeness}`);
     state.selectedSkus.clear();
+    state.productPage = 1;
     await Promise.all([loadProducts(), loadSystemStatus()]);
   } catch (error) {
     notify(error.message, "error");
@@ -443,14 +470,16 @@ async function logout() {
 
 function bindEvents() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
-  ["#productSearch", "#categoryFilter", "#operatorFilter", "#publishFilter"].forEach((selector) => $(selector).addEventListener("input", renderProducts));
+  ["#productSearch", "#categoryFilter", "#operatorFilter", "#publishFilter"].forEach((selector) => $(selector).addEventListener("input", () => { state.productPage = 1; renderProducts(); }));
   $("#selectAll").addEventListener("change", (event) => {
-    currentFilteredProducts().forEach((product) => {
+    pagedProducts().items.forEach((product) => {
       const sku = String(product.sku);
       if (event.currentTarget.checked) state.selectedSkus.add(sku); else state.selectedSkus.delete(sku);
     });
     renderProducts();
   });
+  $("#productPrev").addEventListener("click", () => { state.productPage -= 1; renderProducts(); });
+  $("#productNext").addEventListener("click", () => { state.productPage += 1; renderProducts(); });
   $("#bulkPublish").addEventListener("click", () => bulkSetPublished(true));
   $("#bulkUnpublish").addEventListener("click", () => bulkSetPublished(false));
   $("#syncProducts").addEventListener("click", runProductSync);

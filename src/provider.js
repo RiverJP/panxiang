@@ -148,8 +148,10 @@ function supplierPagination(response) {
 /**
  * ReloadN may return a cursor when the catalogue is large. Keep following that
  * cursor so the management console does not silently stop at the first page.
- * Additional official product types can be configured without changing code,
- * for example SUPPLIER_PRODUCT_TYPES=topup,data.
+ * The documented ReloadN catalogue is `type=topup`. Other explicit types can
+ * be configured as a comma-separated list. `all`/`*` deliberately omits the
+ * type filter, but should only be used when ReloadN has enabled that behaviour
+ * for the merchant account.
  */
 export async function listAllSupplierProducts() {
   const types = [...new Set(String(process.env.SUPPLIER_PRODUCT_TYPES || "topup")
@@ -168,21 +170,25 @@ export async function listAllSupplierProducts() {
     let expectedTotal = null;
     let complete = false;
     const seenCursors = new Set();
+    const typeSkus = new Set();
     for (let page = 0; page < 100; page += 1) {
-      const query = { type, ...(cursor ? { cursor } : {}) };
+      const query = { ...(["all", "*"].includes(type.toLowerCase()) ? {} : { type }), ...(cursor ? { cursor } : {}) };
       const response = await supplierRequest("GET", "/v1/products", query);
       pages += 1;
       const items = supplierProductItems(response);
-      fetched += items.length;
       for (const item of items) {
         const sku = String(item?.sku || item?.code || item?.product_code || item?.id || "");
-        if (sku) bySku.set(sku, item);
+        if (sku) {
+          typeSkus.add(sku);
+          bySku.set(sku, item);
+        }
       }
+      fetched = typeSkus.size;
       const pageInfo = supplierPagination(response);
       if (pageInfo.total !== null) expectedTotal = pageInfo.total;
       if (!pageInfo.cursor) {
         if (pageInfo.hasMoreKnown && pageInfo.hasMore === true) {
-          complete = false;
+          throw new Error(`供应商提示仍有下一页，但未返回分页游标（type=${type}）`);
         } else {
           const explicitlyFinished = (pageInfo.hasMoreKnown && pageInfo.hasMore === false)
             || (pageInfo.cursorKnown && (!pageInfo.hasMoreKnown || pageInfo.hasMore === false));
