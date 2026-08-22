@@ -228,6 +228,23 @@ function normalizeSupplierProduct(item) {
   return { sku, operator: item.operator || item.telco || item.provider || "", kind: item.type || item.kind || "流量", name: item.name || item.title || sku, buyPriceIdr: Number.isFinite(idr) ? idr : null, active: item.active !== false && item.status !== "inactive", raw: item };
 }
 
+function getAutoPriceCny(product, fx) {
+  if (product?.buyPriceIdr === null || product?.buyPriceIdr === undefined || product?.buyPriceIdr === "" || fx?.idrPerCny === null || fx?.idrPerCny === undefined || fx?.idrPerCny === "") return null;
+  const buyPriceIdr = Number(product.buyPriceIdr);
+  const idrPerCny = Number(fx.idrPerCny);
+  if (!Number.isFinite(buyPriceIdr) || !Number.isFinite(idrPerCny) || idrPerCny <= 0) return null;
+  return Math.max(0, Number(((buyPriceIdr - 120) / idrPerCny).toFixed(2)));
+}
+
+function getSellPriceCny(product, fx) {
+  if (product?.priceMode === "manual") {
+    if (product.priceCny === null || product.priceCny === undefined || product.priceCny === "") return null;
+    const manualPrice = Number(product.priceCny);
+    return Number.isFinite(manualPrice) && manualPrice > 0 ? manualPrice : null;
+  }
+  return getAutoPriceCny(product, fx);
+}
+
 async function adminApi(req, res, url) {
   if (!url.pathname.startsWith("/api/admin/")) return false;
   if (req.method === "GET" && url.pathname === "/api/admin/captcha") {
@@ -284,7 +301,8 @@ async function adminApi(req, res, url) {
   if (!requireAdmin(req, res, !["GET", "HEAD"].includes(req.method))) return true;
   if (req.method === "GET" && url.pathname === "/api/admin/products") {
     const products = await readJson(productsFile, []);
-    return json(res, 200, { ok: true, products });
+    const fx = await readJson(fxFile, null);
+    return json(res, 200, { ok: true, products: products.map((product) => ({ ...product, autoPriceCny: getAutoPriceCny(product, fx) })) });
   }
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync") {
     if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) return json(res, 503, { ok: false, message: "供应商 API 未配置" });
@@ -305,7 +323,11 @@ async function adminApi(req, res, url) {
     if (typeof input.published === "boolean") product.published = input.published;
     if (typeof input.description === "string") product.description = input.description.slice(0, 500);
     if (input.priceMode === "auto" || input.priceMode === "manual") product.priceMode = input.priceMode;
-    if (input.priceCny !== undefined && Number.isFinite(Number(input.priceCny))) product.priceCny = Math.max(0, Number(input.priceCny));
+    if (product.priceMode === "manual") {
+      const manualPrice = Number(input.priceCny);
+      if (input.priceCny === "" || !Number.isFinite(manualPrice) || manualPrice <= 0) return json(res, 400, { ok: false, message: "请输入有效的手动售价" });
+      product.priceCny = manualPrice;
+    }
     await writeJson(productsFile, products);
     return json(res, 200, { ok: true, product });
   }
@@ -354,7 +376,7 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    const published = managed.filter((p) => p.published).map((p) => ({ ...p, id: p.sku, label: p.name || p.sku, popular: false, price: p.priceMode === "manual" ? p.priceCny : (p.buyPriceIdr && fx?.idrPerCny ? Number(((p.buyPriceIdr - 120) / fx.idrPerCny).toFixed(2)) : p.priceCny) })).filter((p) => Number.isFinite(p.price));
+    const published = managed.filter((p) => p.published).map((p) => ({ ...p, id: p.sku, label: p.name || p.sku, popular: false, price: getSellPriceCny(p, fx) })).filter((p) => Number.isFinite(p.price));
     return json(res, 200, { ok: true, currency: "CNY", products: published.length ? published : catalog });
   }
   if (req.method === "GET" && url.pathname.startsWith("/api/orders/")) {
@@ -367,7 +389,7 @@ async function handleApi(req, res, url) {
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
     const managedItem = managed.find((p) => p.sku === input.productId && p.published);
-    const product = managedItem ? { ...managedItem, id: managedItem.sku, label: managedItem.name || managedItem.sku, price: managedItem.priceMode === "manual" ? managedItem.priceCny : (managedItem.buyPriceIdr && fx?.idrPerCny ? Number(((managedItem.buyPriceIdr - 120) / fx.idrPerCny).toFixed(2)) : managedItem.priceCny) } : findProduct(input.productId);
+    const product = managedItem ? { ...managedItem, id: managedItem.sku, label: managedItem.name || managedItem.sku, price: getSellPriceCny(managedItem, fx) } : findProduct(input.productId);
     const phone = normalizePhone(input.phone);
     const detectedOperator = detectOperator(phone);
     if (!product) return json(res, 400, { ok: false, message: "套餐不存在" });
