@@ -18,6 +18,9 @@ const state = {
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const productMutationsInFlight = new Set();
+let productLoadRequestId = 0;
+let lastAppliedProductLoadRequestId = 0;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -56,13 +59,25 @@ async function api(url, options = {}) {
   if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   if (!new Set(["GET", "HEAD", "OPTIONS"]).has(method)) headers["X-CSRF-Token"] = state.csrfToken;
 
-  const response = await fetch(url, {
-    ...options,
-    method,
-    headers,
-    credentials: "same-origin",
-    cache: "no-store"
-  });
+  const controller = new AbortController();
+  const timeoutMs = new Set(["GET", "HEAD", "OPTIONS"]).has(method) ? 15000 : 60000;
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      method,
+      headers,
+      signal: options.signal || controller.signal,
+      credentials: "same-origin",
+      cache: "no-store"
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("请求超时，请重试");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
   let data = {};
   try { data = await response.json(); } catch { /* The status code still controls the result. */ }
   if (response.status === 401) {
@@ -205,7 +220,7 @@ function publishedProductAvailability(product) {
     return { sellable: true, label: "前台可售", reason: "用户可正常购买" };
   }
   if (product.active !== true) {
-    return { sellable: false, label: "暂不可售", reason: product.unavailableReason || "供应商当前不可用" };
+    return { sellable: false, label: "暂不可售", reason: product.unavailableReason || "最近确认的完整目录中已缺失" };
   }
   if (!["airtime", "data"].includes(String(product.category || ""))) {
     return { sellable: false, label: "暂不可售", reason: "尚未选择话费或流量分类" };
@@ -339,7 +354,9 @@ async function savePublishedOrder() {
 }
 
 function productRow(product) {
-  const active = product.active !== false;
+  const sku = String(product.sku);
+  const active = product.active === true;
+  const saving = productMutationsInFlight.has(sku);
   const sourceEligible = (product.sourceEligible ?? product.eligible) === true;
   const automatic = product.priceMode !== "manual";
   const price = automatic ? product.autoPriceCny : product.priceCny;
@@ -349,13 +366,13 @@ function productRow(product) {
   return `<tr data-sku="${escapeHtml(product.sku)}">
     <td><input class="row-select" type="checkbox" aria-label="选择 ${escapeHtml(product.sku)}" ${checked ? "checked" : ""}></td>
     <td><div class="sku-title">${escapeHtml(product.name || product.sku)}</div><div class="subline">${escapeHtml(product.sku)} · ${escapeHtml(product.operator || "未知运营商")}</div></td>
-    <td><select class="table-select product-category" aria-label="商品分类"><option value="unclassified" ${!["airtime", "data"].includes(product.category) ? "selected" : ""}>待分类 / 其他</option><option value="airtime" ${product.category === "airtime" ? "selected" : ""}>话费充值</option><option value="data" ${product.category === "data" ? "selected" : ""}>流量套餐</option></select><br><input class="table-input operator-input product-operator" maxlength="80" value="${escapeHtml(product.operator || "")}" placeholder="运营商" aria-label="运营商"><br><span class="state-badge ${active ? "" : "offline"}">${active ? "供应正常" : "供应不可用"}</span>${product.excludeReason ? `<div class="subline">${escapeHtml(product.excludeReason)}</div>` : ""}${product.unavailableReason ? `<div class="subline">${escapeHtml(product.unavailableReason)}</div>` : ""}</td>
+    <td><select class="table-select product-category" aria-label="商品分类"><option value="unclassified" ${!["airtime", "data"].includes(product.category) ? "selected" : ""}>待分类 / 其他</option><option value="airtime" ${product.category === "airtime" ? "selected" : ""}>话费充值</option><option value="data" ${product.category === "data" ? "selected" : ""}>流量套餐</option></select><br><input class="table-input operator-input product-operator" maxlength="80" value="${escapeHtml(product.operator || "")}" placeholder="运营商" aria-label="运营商"><br><span class="state-badge ${active ? "" : "offline"}">${active ? "当前目录存在" : "完整目录已缺失"}</span>${product.excludeReason ? `<div class="subline">${escapeHtml(product.excludeReason)}</div>` : ""}${product.unavailableReason ? `<div class="subline">${escapeHtml(product.unavailableReason)}</div>` : ""}</td>
     <td><div class="cost">${product.buyPriceIdr == null ? "—" : Number(product.buyPriceIdr).toLocaleString("zh-CN")}</div><div class="subline">IDR</div></td>
     <td><input class="table-input name-input product-name" maxlength="120" value="${escapeHtml(product.name || product.sku)}" aria-label="前台名称"><br><input class="table-input description-input product-description" maxlength="500" value="${escapeHtml(product.description || "")}" placeholder="套餐说明" aria-label="套餐说明"></td>
     <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? escapeHtml(autoPriceReason) : "售价"}"><div class="subline">${automatic && price == null ? escapeHtml(autoPriceReason) : "人民币"}</div></td>
     <td><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label><div class="subline">排序请到“上架商品”页面调整</div><label class="display-controls approval-control"><input class="product-manual-approval" type="checkbox" ${sourceEligible || product.manualCatalogApproved ? "checked" : ""} ${sourceEligible ? "disabled" : ""}> ${sourceEligible ? "系统已识别" : "确认是印尼通信套餐"}</label></td>
-    <td><label class="switch" title="${active ? "设置上架状态" : "供应商不可用，无法上架"}"><input class="product-published" type="checkbox" ${product.published ? "checked" : ""} ${active ? "" : "disabled"}><span class="slider"></span></label></td>
-    <td><button class="save-button save-product">保存</button></td>
+    <td><label class="switch" title="${saving ? "正在保存" : active ? "点击后立即保存上架状态" : "最近确认的完整目录中已缺失，无法上架"}"><input class="product-published" type="checkbox" ${product.published ? "checked" : ""} ${active && !saving ? "" : "disabled"}><span class="slider"></span></label><div class="subline">${saving ? "保存中…" : product.published ? "已上架 · 点击即下架" : active ? "点击即上架" : "重新同步后确认"}</div></td>
+    <td><button class="save-button save-product" ${saving ? "disabled" : ""}>${saving ? "保存中…" : "保存"}</button></td>
   </tr>`;
 }
 
@@ -376,7 +393,7 @@ function renderProducts() {
   const page = pagedProducts(filtered);
   const products = page.items;
   $("#statProducts").textContent = state.products.length.toLocaleString("zh-CN");
-  $("#statPublished").textContent = state.products.filter((product) => product.published && product.active !== false).length.toLocaleString("zh-CN");
+  $("#statPublished").textContent = state.products.filter((product) => product.published && product.active === true).length.toLocaleString("zh-CN");
   $("#statUnavailable").textContent = state.products.filter((product) => product.active === false).length.toLocaleString("zh-CN");
   $("#productResultCount").textContent = `当前筛选 ${filtered.length.toLocaleString("zh-CN")} / 本地 ${state.products.length.toLocaleString("zh-CN")}，每页最多 ${state.productPageSize} 个`;
   $("#productPageInfo").textContent = `第 ${state.productPage} / ${page.totalPages} 页`;
@@ -395,6 +412,7 @@ function renderProducts() {
     });
   });
   $$(".price-mode", $("#productRows")).forEach((select) => select.addEventListener("change", onPriceModeChange));
+  $$(".product-published", $("#productRows")).forEach((input) => input.addEventListener("change", savePublishedState));
   $$(".save-product", $("#productRows")).forEach((button) => button.addEventListener("click", saveProduct));
   updateSelectionSummary(products);
 }
@@ -410,11 +428,7 @@ function onPriceModeChange(event) {
   if (!automatic) input.focus();
 }
 
-async function saveProduct(event) {
-  const button = event.currentTarget;
-  const row = button.closest("tr");
-  const sku = row.dataset.sku;
-  const product = state.products.find((item) => String(item.sku) === sku);
+function productPayloadFromRow(row, product) {
   const priceMode = $(".price-mode", row).value;
   const priceInput = $(".product-price", row);
   const approvalInput = $(".product-manual-approval", row);
@@ -429,31 +443,88 @@ async function saveProduct(event) {
     manualCatalogApproved: sourceEligible ? Boolean(product?.manualCatalogApproved) : approvalInput.checked,
     published: $(".product-published", row).checked
   };
-  if (!payload.name) return notify("前台商品名称不能为空", "error");
-  if (payload.published && !["airtime", "data"].includes(payload.category)) return notify("上架前请先选择话费或流量分类", "error");
-  if (payload.published && (!payload.operator || payload.operator === "未知运营商")) return notify("上架前请填写运营商", "error");
-  if (payload.published && !sourceEligible && !payload.manualCatalogApproved) return notify("该 SKU 未被系统识别为印尼通信套餐，请人工核对后勾选确认", "error");
+  if (!payload.name) throw new Error("前台商品名称不能为空");
+  if (payload.published && !["airtime", "data"].includes(payload.category)) throw new Error("上架前请先选择话费或流量分类");
+  if (payload.published && (!payload.operator || payload.operator === "未知运营商")) throw new Error("上架前请填写运营商");
+  if (payload.published && !sourceEligible && !payload.manualCatalogApproved) throw new Error("该 SKU 未被系统识别为印尼通信套餐，请人工核对后勾选确认");
   if (priceMode === "manual") {
     payload.priceCny = Number(priceInput.value);
-    if (!Number.isFinite(payload.priceCny) || payload.priceCny <= 0) return notify("请输入有效的手动售价", "error");
+    if (!Number.isFinite(payload.priceCny) || payload.priceCny <= 0) throw new Error("请输入有效的手动售价");
   } else if (!priceInput.value && payload.published) {
-    return notify("自动价格尚未生成，请先刷新汇率", "error");
+    throw new Error("自动价格尚未生成，请先刷新汇率");
+  }
+  return payload;
+}
+
+async function persistProductRow(row, { button = null, publishedChanged = false } = {}) {
+  const sku = row.dataset.sku;
+  const product = state.products.find((item) => String(item.sku) === sku);
+  const publishInput = $(".product-published", row);
+  const previousPublished = Boolean(product?.published);
+  if (productMutationsInFlight.has(sku)) {
+    if (publishedChanged) publishInput.checked = previousPublished;
+    notify(`${sku} 正在保存，请稍候`, "error");
+    return false;
   }
 
-  setButtonBusy(button, true, "保存中…");
+  let payload;
   try {
-    await api(`/api/admin/products/${encodeURIComponent(sku)}`, { method: "PUT", body: JSON.stringify(payload) });
-    notify(`${sku} 已保存`);
-    await loadProducts();
+    // The publish switch owns only the publication state. Sending the whole
+    // visible row here could overwrite a newer catalogue sync or another tab's
+    // edits with stale form values. Other product fields are saved explicitly
+    // with the row's Save button.
+    payload = publishedChanged
+      ? { published: publishInput.checked }
+      : productPayloadFromRow(row, product);
   } catch (error) {
+    if (publishedChanged) publishInput.checked = previousPublished;
     notify(error.message, "error");
-  } finally {
-    setButtonBusy(button, false);
+    return false;
   }
+
+  productMutationsInFlight.add(sku);
+  publishInput.disabled = true;
+  setButtonBusy(button, true, publishedChanged ? (payload.published ? "上架中…" : "下架中…") : "保存中…");
+  let result;
+  try {
+    result = await api(`/api/admin/products/${encodeURIComponent(sku)}`, { method: "PUT", body: JSON.stringify(payload) });
+  } catch (error) {
+    productMutationsInFlight.delete(sku);
+    setButtonBusy(button, false);
+    notify(error.message, "error");
+    renderProducts();
+    return false;
+  }
+
+  const successMessage = publishedChanged ? `${sku} 已${payload.published ? "上架" : "下架"}` : `${sku} 已保存`;
+  productMutationsInFlight.delete(sku);
+  setButtonBusy(button, false);
+  const productIndex = state.products.findIndex((item) => String(item.sku) === sku);
+  if (productIndex >= 0 && result?.product) state.products[productIndex] = result.product;
+  const serverPublishedOrder = result?.publishedOrder && typeof result.publishedOrder === "object" ? result.publishedOrder : {};
+  if (serverPublishedOrder.revision !== undefined) state.orderRevision = serverPublishedOrder.revision;
+  renderProducts();
+  resetPublishedOrderFromProducts(serverPublishedOrder.skus);
+  notify(successMessage);
+  return Boolean(result?.product);
+}
+
+async function saveProduct(event) {
+  const button = event.currentTarget;
+  await persistProductRow(button.closest("tr"), { button });
+}
+
+async function savePublishedState(event) {
+  const input = event.currentTarget;
+  const row = input.closest("tr");
+  await persistProductRow(row, { button: $(".save-product", row), publishedChanged: true });
 }
 
 async function loadProducts() {
+  const requestId = ++productLoadRequestId;
   const data = await api("/api/admin/products");
+  if (requestId < lastAppliedProductLoadRequestId) return;
+  lastAppliedProductLoadRequestId = requestId;
   state.products = Array.isArray(data.products) ? data.products : [];
   const serverPublishedOrder = data.publishedOrder && typeof data.publishedOrder === "object" ? data.publishedOrder : {};
   state.orderRevision = serverPublishedOrder.revision ?? "";
@@ -523,7 +594,10 @@ async function bulkSetPublished(published) {
   setButtonBusy(button, true, `${action}中…`);
   try {
     const result = await api("/api/admin/products/bulk", { method: "POST", body: JSON.stringify({ skus, published }) });
-    notify(`批量${action}完成，实际更新 ${result.changed || 0} 项`);
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    const missing = Array.isArray(result.missing) ? result.missing.length : 0;
+    const firstSkippedReason = result.skipped?.[0]?.reason;
+    notify(`批量${action}完成，更新 ${result.changed || 0} 项${skipped || missing ? `，跳过 ${skipped + missing} 项${firstSkippedReason ? `（${firstSkippedReason}）` : ""}` : ""}`);
     state.selectedSkus.clear();
     await loadProducts();
   } catch (error) {

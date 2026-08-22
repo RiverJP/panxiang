@@ -40,7 +40,7 @@
         <div class="stats-grid">
           <article class="stat-card"><span>本地已保存 SKU</span><strong id="statProducts">—</strong><small>服务器当前保存总数</small></article>
           <article class="stat-card"><span>已上架</span><strong id="statPublished">—</strong><small>前台当前可购买</small></article>
-          <article class="stat-card"><span>供应商不可用</span><strong id="statUnavailable">—</strong><small>已自动停止前台销售</small></article>
+          <article class="stat-card"><span>完整目录已缺失</span><strong id="statUnavailable">—</strong><small>已自动停止前台销售</small></article>
           <article class="stat-card"><span>IDR / CNY</span><strong id="statRate">—</strong><small id="statRateTime">等待汇率更新</small></article>
         </div>
 
@@ -49,7 +49,7 @@
             <label class="search-box"><span>⌕</span><input id="productSearch" placeholder="搜索 SKU、名称、描述或运营商"></label>
             <select id="categoryFilter"><option value="all">全部类型</option><option value="airtime">话费充值</option><option value="data">流量套餐</option><option value="unclassified">待分类 / 其他</option></select>
             <select id="operatorFilter"><option value="all">全部运营商</option></select>
-            <select id="publishFilter"><option value="all">全部上架状态</option><option value="published">已上架</option><option value="hidden">未上架</option><option value="unavailable">供应商不可用</option></select>
+            <select id="publishFilter"><option value="all">全部上架状态</option><option value="published">已上架</option><option value="hidden">未上架</option><option value="unavailable">完整目录已缺失</option></select>
             <button class="mini-button clear-filter-button" id="clearProductFilters" type="button">清除筛选</button>
           </div>
           <div class="catalog-diagnostics" aria-label="商品同步诊断" aria-live="polite">

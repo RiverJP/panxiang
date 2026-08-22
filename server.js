@@ -8,7 +8,13 @@ import { fileURLToPath } from "node:url";
 import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrder, querySupplierOrder, verifyWebhookSignature, listAllSupplierProducts } from "./src/provider.js";
 import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
 import { createOrderStore } from "./src/order-store.js";
-import { supplierBuyPriceIdr, supplierProductAvailability, autoPriceState } from "./src/catalog-pricing.js";
+import {
+  MISSING_FROM_COMPLETE_CATALOG_REASON,
+  supplierBuyPriceIdr,
+  supplierProductAvailability,
+  normalizeStoredSupplierAvailability,
+  autoPriceState
+} from "./src/catalog-pricing.js";
 import {
   appendCatalogDisplayOrder,
   assignCatalogDisplayOrder,
@@ -69,6 +75,17 @@ async function appendAudit(action, details = {}) {
   const entries = await readJson(auditFile, []);
   entries.push({ action, details, at: new Date().toISOString() });
   await writeJson(auditFile, entries.slice(-1000));
+}
+
+async function migrateStoredProductAvailability() {
+  const products = await readJson(productsFile, null);
+  if (!Array.isArray(products)) return;
+  const migrated = products.map(normalizeStoredSupplierAvailability);
+  if (JSON.stringify(migrated) === JSON.stringify(products)) return;
+  const restoredCount = products.filter((product, index) => product?.active !== true && migrated[index]?.active === true).length;
+  const confirmedMissingCount = migrated.filter((product) => product.active === false).length;
+  await writeJson(productsFile, migrated);
+  await appendAudit("products.availability_migrated", { restoredCount, confirmedMissingCount });
 }
 
 function parseCookies(req) {
@@ -329,10 +346,10 @@ function normalizeSupplierProduct(item) {
   const blocked = blockedProductPattern.test(text);
   const sourceEligible = Boolean(sku && countryOk && inferredOperator && ["airtime", "data"].includes(category) && !blocked);
   const buyPriceIdr = supplierBuyPriceIdr(item, { allowUndeclaredGeneric: sourceEligible });
-  // ReloadN's product catalogue does not guarantee a separate availability
-  // field. A product present in the current catalogue is therefore sellable
-  // unless the supplier explicitly marks it unavailable.
-  const availability = supplierProductAvailability(item, { listedProductsDefaultActive: true });
+  // Catalogue presence is the availability signal. ReloadN status fields are
+  // intentionally ignored because they can describe a channel rather than the
+  // SKU's ability to accept an API order.
+  const availability = supplierProductAvailability(item);
   const name = String(item.name || item.title || item.product_name || sku);
   return {
     sku,
@@ -493,7 +510,7 @@ async function syncSupplierCatalog(source = "manual") {
     for (const previous of old) {
       if (seen.has(previous.sku)) continue;
       products.push(canRetireMissing
-        ? { ...previous, active: false, published: false, unavailableReason: "供应商完整目录未返回该商品", syncedAt: now }
+        ? { ...previous, active: false, statusKnown: false, published: false, unavailableReason: MISSING_FROM_COMPLETE_CATALOG_REASON, syncedAt: now }
         : { ...previous });
     }
     products.sort((left, right) => String(left.operator || "").localeCompare(String(right.operator || "")) || String(left.category || "").localeCompare(String(right.category || "")) || String(left.sku || "").localeCompare(String(right.sku || "")));
@@ -510,7 +527,7 @@ async function syncSupplierCatalog(source = "manual") {
       supplierCount: normalized.length,
       eligibleCount: sourceEligible.length,
       excludedCount: normalized.length - sourceEligible.length,
-      unavailableCount: products.filter((product) => !product.active).length
+      unavailableCount: products.filter((product) => product.active === false).length
     };
     await writeJson(productsFile, products);
     await writeJson(syncMetaFile, meta);
@@ -714,7 +731,27 @@ async function adminApi(req, res, url) {
       const productsBySku = new Map(products.map((product) => [String(product.sku), product]));
       const selectedProducts = skus.map((sku) => productsBySku.get(sku)).filter(Boolean);
       const eligibleProducts = selectedProducts.filter((product) => !input.published
-        || (product.active && productCanAppearInCatalog(product) && getSellPriceCny(product, fx) !== null));
+        || (product.active === true && productCanAppearInCatalog(product) && getSellPriceCny(product, fx) !== null));
+      const skipped = input.published
+        ? selectedProducts.filter((product) => !eligibleProducts.includes(product)).map((product) => ({
+          sku: String(product.sku),
+          reason: product.active !== true
+            ? "最近确认的完整目录中已缺失"
+            : !productCanAppearInCatalog(product)
+              ? "尚未完成通信套餐分类、运营商或人工确认"
+              : "尚无有效售价"
+        }))
+        : [];
+      const missing = skus.filter((sku) => !productsBySku.has(sku));
+      if (input.published && eligibleProducts.length === 0) {
+        const firstReason = skipped[0]?.reason || (missing.length ? "SKU 不存在" : "没有符合上架条件的商品");
+        return json(res, 409, {
+          ok: false,
+          message: `所选商品均未上架：${firstReason}`,
+          skipped,
+          missing
+        });
+      }
       const newlyPublishedSkus = input.published
         ? eligibleProducts.filter((product) => !product.published).map((product) => String(product.sku))
         : [];
@@ -725,12 +762,18 @@ async function adminApi(req, res, url) {
       }
       let changed = 0;
       for (const product of eligibleProducts) {
+        if (Boolean(product.published) !== input.published) changed += 1;
         product.published = input.published;
-        changed += 1;
       }
       await writeJson(productsFile, products);
       await appendAudit(input.published ? "products.bulk_publish" : "products.bulk_unpublish", { skus, changed });
-      return json(res, 200, { ok: true, changed, publishedOrder: publishedCatalogOrderState(products, fx) });
+      return json(res, 200, {
+        ok: true,
+        changed,
+        skipped,
+        missing,
+        publishedOrder: publishedCatalogOrderState(products, fx)
+      });
     });
   }
   if (req.method === "PUT" && url.pathname === "/api/admin/products/order") {
@@ -786,12 +829,13 @@ async function adminApi(req, res, url) {
       if (typeof input.description === "string") product.description = input.description.slice(0, 500);
       if (typeof input.popular === "boolean") product.popular = input.popular;
       if (input.priceMode === "auto" || input.priceMode === "manual") product.priceMode = input.priceMode;
-      if (product.priceMode === "manual") {
+      const manualPriceWasSubmitted = Object.hasOwn(input, "priceCny") || input.priceMode === "manual";
+      if (product.priceMode === "manual" && (requestedPublished || manualPriceWasSubmitted)) {
         const manualPrice = Number(input.priceCny);
         if (input.priceCny === "" || !Number.isFinite(manualPrice) || manualPrice <= 0) return json(res, 400, { ok: false, message: "请输入有效的手动售价" });
         product.priceCny = manualPrice;
       }
-      if (requestedPublished && !product.active) return json(res, 400, { ok: false, message: "供应商已停用该商品，不能上架" });
+      if (requestedPublished && product.active !== true) return json(res, 400, { ok: false, message: "该 SKU 已从最近确认的完整目录中缺失，请重新同步确认后再上架" });
       if (requestedPublished && !productCanAppearInCatalog(product)) return json(res, 400, { ok: false, message: "请先确认商品是印尼通信套餐，并完成分类和运营商设置" });
       if (requestedPublished && getSellPriceCny(product, fx) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
       if (requestedPublished && !wasPublished) {
@@ -850,8 +894,8 @@ async function adminApi(req, res, url) {
       ok: true,
       status: {
         products: products.length,
-        published: products.filter((product) => product.published && product.active).length,
-        unavailable: products.filter((product) => !product.active).length,
+        published: products.filter((product) => product.published && product.active === true).length,
+        unavailable: products.filter((product) => product.active === false).length,
         orders: orderStore.listOrders({ limit: 2000 }).length,
         fx,
         sync,
@@ -1142,6 +1186,11 @@ async function scheduledMaintenance() {
   }
 }
 
+try {
+  await migrateStoredProductAvailability();
+} catch (error) {
+  console.error("Stored product availability migration failed:", error.message);
+}
 server.listen(port, () => console.log(`Panxiang Recharge listening on http://localhost:${port}`));
 setTimeout(scheduledMaintenance, 5000).unref();
 setInterval(scheduledMaintenance, 30 * 60 * 1000).unref();

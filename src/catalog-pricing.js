@@ -1,4 +1,5 @@
 const idrCurrencies = new Set(["IDR", "RP", "RUPIAH", "INDONESIAN RUPIAH"]);
+export const MISSING_FROM_COMPLETE_CATALOG_REASON = "供应商完整目录未返回该商品";
 
 function firstPresent(...values) {
   return values.find((value) => value !== null && value !== undefined && value !== "");
@@ -66,24 +67,34 @@ export function supplierBuyPriceIdr(item, {
   ));
 }
 
-export function supplierProductAvailability(item, { listedProductsDefaultActive = false } = {}) {
-  const unavailable = new Set([
-    "0", "false", "no", "off", "inactive", "disabled", "offline", "suspended", "unavailable",
-    "maintenance", "maintaining", "out_of_stock", "out-of-stock", "out of stock", "sold_out", "sold-out", "sold out", "closed"
-  ]);
-  const available = new Set(["1", "true", "yes", "on", "active", "enabled", "online", "available", "ready", "live", "open", "normal", "in_stock", "in-stock", "in stock"]);
-  const candidates = [item.active, item.is_active, item.isActive, item.enabled, item.is_enabled, item.isEnabled, item.available, item.is_available, item.isAvailable, item.status, item.state, item.product_status, item.productStatus, item.availability]
-    .filter((value) => value !== null && value !== undefined && value !== "")
-    .map((value) => String(value).trim().toLowerCase());
+export function supplierProductAvailability() {
+  // ReloadN's catalogue is the source of truth for saleability: if a SKU is
+  // returned by the current catalogue request, it is available. Some catalogue
+  // rows contain stale or channel-specific status fields, so those fields must
+  // not override catalogue presence.
+  return { active: true, statusKnown: false, unavailableReason: "" };
+}
 
-  if (!candidates.length) {
-    return listedProductsDefaultActive
-      ? { active: true, statusKnown: false, unavailableReason: "供应商未单独返回状态，按当前产品目录视为可用" }
-      : { active: false, statusKnown: false, unavailableReason: "供应商未返回可用状态" };
+export function normalizeStoredSupplierAvailability(product) {
+  const confirmedMissing = product?.unavailableReason === MISSING_FROM_COMPLETE_CATALOG_REASON;
+  if (confirmedMissing) {
+    return {
+      ...product,
+      active: false,
+      statusKnown: false,
+      published: false,
+      unavailableReason: MISSING_FROM_COMPLETE_CATALOG_REASON
+    };
   }
-  if (candidates.some((value) => unavailable.has(value))) return { active: false, statusKnown: true, unavailableReason: "供应商标记为不可用" };
-  if (candidates.some((value) => available.has(value))) return { active: true, statusKnown: true, unavailableReason: "" };
-  return { active: false, statusKnown: false, unavailableReason: `未识别供应状态：${candidates[0]}` };
+
+  const restored = product?.active !== true;
+  return {
+    ...product,
+    active: true,
+    statusKnown: false,
+    unavailableReason: "",
+    ...(restored ? { published: false } : {})
+  };
 }
 
 export function autoPriceState(product, fx, {
