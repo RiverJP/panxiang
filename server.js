@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrder, querySupplierOrder, verifyWebhookSignature, listAllSupplierProducts } from "./src/provider.js";
 import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
 import { createOrderStore } from "./src/order-store.js";
+import { supplierBuyPriceIdr, supplierProductAvailability, autoPriceState } from "./src/catalog-pricing.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(root, ".env");
@@ -308,61 +309,6 @@ function supplierCountryLabel(item) {
   return String(item.country_code || item.countryCode || item.country || item.iso_country || item.isoCountry || "").trim();
 }
 
-function numericIdr(value) {
-  const parsed = Number(String(value ?? "").replace(/,/g, ""));
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
-function supplierCurrency(item) {
-  const value = item.currency
-    ?? item.currency_code
-    ?? item.currencyCode
-    ?? item.buy_currency
-    ?? item.buyCurrency
-    ?? item.cost_currency
-    ?? item.costCurrency
-    ?? item.price?.currency
-    ?? item.price?.currency_code
-    ?? item.price?.currencyCode;
-  return String(value ?? "").trim().toUpperCase();
-}
-
-function supplierBuyPriceIdr(item) {
-  const declaredCurrency = supplierCurrency(item);
-  const currencyIsIdr = ["IDR", "RP", "RUPIAH", "INDONESIAN RUPIAH"].includes(declaredCurrency);
-  if (declaredCurrency && !currencyIsIdr) return null;
-
-  const explicitlyIdr = item.buy_price_idr
-    ?? item.buyPriceIdr
-    ?? item.cost_idr
-    ?? item.costIdr
-    ?? item.price_idr
-    ?? item.priceIdr;
-  if (explicitlyIdr !== null && explicitlyIdr !== undefined && explicitlyIdr !== "") return numericIdr(explicitlyIdr);
-  if (!currencyIsIdr) return null;
-
-  return numericIdr(item.buy_price
-    ?? item.buyPrice
-    ?? item.cost
-    ?? item.price?.amount
-    ?? (typeof item.price === "object" ? null : item.price));
-}
-
-function supplierProductAvailability(item) {
-  const unavailable = new Set([
-    "0", "false", "no", "off", "inactive", "disabled", "offline", "suspended", "unavailable",
-    "maintenance", "maintaining", "out_of_stock", "out-of-stock", "out of stock", "sold_out", "sold-out", "sold out", "closed"
-  ]);
-  const available = new Set(["1", "true", "yes", "on", "active", "enabled", "online", "available", "ready", "live", "open", "normal", "in_stock", "in-stock", "in stock"]);
-  const candidates = [item.active, item.is_active, item.isActive, item.enabled, item.is_enabled, item.isEnabled, item.available, item.is_available, item.isAvailable, item.status, item.state, item.product_status, item.productStatus, item.availability]
-    .filter((value) => value !== null && value !== undefined && value !== "")
-    .map((value) => String(value).trim().toLowerCase());
-  if (!candidates.length) return { active: false, statusKnown: false, unavailableReason: "供应商未返回可用状态" };
-  if (candidates.some((value) => unavailable.has(value))) return { active: false, statusKnown: true, unavailableReason: "供应商标记为不可用" };
-  if (candidates.some((value) => available.has(value))) return { active: true, statusKnown: true, unavailableReason: "" };
-  return { active: false, statusKnown: false, unavailableReason: `未识别供应状态：${candidates[0]}` };
-}
-
 function normalizeSupplierProduct(item) {
   const sku = String(item.sku || item.code || item.product_code || item.id || "").trim();
   const inferredOperator = inferSupplierOperator(item);
@@ -371,9 +317,9 @@ function normalizeSupplierProduct(item) {
   const text = productText(item);
   const countryOk = indonesiaCountryMatches(item, inferredOperator);
   const blocked = blockedProductPattern.test(text);
-  const buyPriceIdr = supplierBuyPriceIdr(item);
-  const availability = supplierProductAvailability(item);
   const sourceEligible = Boolean(sku && countryOk && inferredOperator && ["airtime", "data"].includes(category) && !blocked);
+  const buyPriceIdr = supplierBuyPriceIdr(item, { allowUndeclaredGeneric: sourceEligible });
+  const availability = supplierProductAvailability(item);
   const name = String(item.name || item.title || item.product_name || sku);
   return {
     sku,
@@ -401,15 +347,7 @@ function productCanAppearInCatalog(product) {
 }
 
 function getAutoPriceCny(product, fx) {
-  if (product?.buyPriceIdr === null || product?.buyPriceIdr === undefined || product?.buyPriceIdr === "" || fx?.idrPerCny === null || fx?.idrPerCny === undefined || fx?.idrPerCny === "") return null;
-  const fxAge = Date.now() - Date.parse(fx.updatedAt || 0);
-  const maxFxAgeHours = Number(process.env.MAX_FX_AGE_HOURS || 24);
-  if (!Number.isFinite(fxAge) || fxAge < 0 || fxAge > maxFxAgeHours * 60 * 60 * 1000) return null;
-  const buyPriceIdr = Number(product.buyPriceIdr);
-  const idrPerCny = Number(fx.idrPerCny);
-  if (!Number.isFinite(buyPriceIdr) || !Number.isFinite(idrPerCny) || idrPerCny <= 0) return null;
-  const calculated = Number(((buyPriceIdr - 120) / idrPerCny).toFixed(2));
-  return Number.isFinite(calculated) && calculated > 0 ? calculated : null;
+  return autoPriceState(product, fx).priceCny;
 }
 
 function getSellPriceCny(product, fx) {
@@ -423,7 +361,13 @@ function getSellPriceCny(product, fx) {
 
 function adminProductView(product, fx) {
   const { raw: _raw, ...view } = product;
-  return { ...view, autoPriceCny: getAutoPriceCny(product, fx) };
+  const pricing = autoPriceState(product, fx);
+  return {
+    ...view,
+    autoPriceCny: pricing.priceCny,
+    autoPriceStatus: pricing.status,
+    autoPriceReason: pricing.reason
+  };
 }
 
 async function refreshFxRate(source = "manual") {

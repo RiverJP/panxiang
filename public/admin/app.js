@@ -111,6 +111,7 @@ function productRow(product) {
   const automatic = product.priceMode !== "manual";
   const price = automatic ? product.autoPriceCny : product.priceCny;
   const missingCost = product.buyPriceIdr == null;
+  const autoPriceReason = product.autoPriceReason || (missingCost ? "缺少供应商买入价" : "汇率尚未同步");
   const checked = state.selectedSkus.has(String(product.sku));
   return `<tr data-sku="${escapeHtml(product.sku)}">
     <td><input class="row-select" type="checkbox" aria-label="选择 ${escapeHtml(product.sku)}" ${checked ? "checked" : ""}></td>
@@ -118,7 +119,7 @@ function productRow(product) {
     <td><select class="table-select product-category" aria-label="商品分类"><option value="unclassified" ${!["airtime", "data"].includes(product.category) ? "selected" : ""}>待分类 / 其他</option><option value="airtime" ${product.category === "airtime" ? "selected" : ""}>话费充值</option><option value="data" ${product.category === "data" ? "selected" : ""}>流量套餐</option></select><br><input class="table-input operator-input product-operator" maxlength="80" value="${escapeHtml(product.operator || "")}" placeholder="运营商" aria-label="运营商"><br><span class="state-badge ${active ? "" : "offline"}">${active ? "供应正常" : "供应不可用"}</span>${product.excludeReason ? `<div class="subline">${escapeHtml(product.excludeReason)}</div>` : ""}${product.unavailableReason ? `<div class="subline">${escapeHtml(product.unavailableReason)}</div>` : ""}</td>
     <td><div class="cost">${product.buyPriceIdr == null ? "—" : Number(product.buyPriceIdr).toLocaleString("zh-CN")}</div><div class="subline">IDR</div></td>
     <td><input class="table-input name-input product-name" maxlength="120" value="${escapeHtml(product.name || product.sku)}" aria-label="前台名称"><br><input class="table-input description-input product-description" maxlength="500" value="${escapeHtml(product.description || "")}" placeholder="套餐说明" aria-label="套餐说明"></td>
-    <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? (missingCost ? "缺少买入价" : "汇率未就绪") : "售价"}"><div class="subline">${automatic && missingCost ? "可切换手动定价" : "人民币"}</div></td>
+    <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? escapeHtml(autoPriceReason) : "售价"}"><div class="subline">${automatic && price == null ? escapeHtml(autoPriceReason) : "人民币"}</div></td>
     <td><input class="table-input sort-input product-sort" type="number" min="-9999" max="9999" step="1" value="${escapeHtml(product.sortOrder ?? 0)}" aria-label="排序"><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label><label class="display-controls approval-control"><input class="product-manual-approval" type="checkbox" ${sourceEligible || product.manualCatalogApproved ? "checked" : ""} ${sourceEligible ? "disabled" : ""}> ${sourceEligible ? "系统已识别" : "确认是印尼通信套餐"}</label></td>
     <td><label class="switch" title="${active ? "设置上架状态" : "供应商不可用，无法上架"}"><input class="product-published" type="checkbox" ${product.published ? "checked" : ""} ${active ? "" : "disabled"}><span class="slider"></span></label></td>
     <td><button class="save-button save-product">保存</button></td>
@@ -171,7 +172,7 @@ function onPriceModeChange(event) {
   const automatic = event.currentTarget.value === "auto";
   input.readOnly = automatic;
   input.value = automatic ? (product?.autoPriceCny == null ? "" : Number(product.autoPriceCny).toFixed(2)) : (product?.priceCny ?? product?.autoPriceCny ?? "");
-  input.placeholder = automatic && !input.value ? (product?.buyPriceIdr == null ? "缺少买入价" : "汇率未就绪") : "售价";
+  input.placeholder = automatic && !input.value ? (product?.autoPriceReason || (product?.buyPriceIdr == null ? "缺少供应商买入价" : "汇率尚未同步")) : "售价";
   if (!automatic) input.focus();
 }
 
