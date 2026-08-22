@@ -5,6 +5,10 @@ const state = {
   products: [],
   orders: [],
   selectedSkus: new Set(),
+  publishedOrder: [],
+  savedPublishedOrder: [],
+  orderRevision: "",
+  draggedPublishedSku: "",
   productPage: 1,
   productPageSize: 100,
   section: "products",
@@ -140,6 +144,200 @@ function renderProductDiagnostics(filteredCount = currentFilteredProducts().leng
   $("#clearProductFilters").disabled = !productFiltersActive();
 }
 
+function productSellPrice(product) {
+  const price = Number(product?.sellPriceCny ?? (product?.priceMode === "manual" ? product?.priceCny : product?.autoPriceCny));
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+function normalizeSortOrder(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(-9999, Math.min(9999, Math.round(parsed))) : 0;
+}
+
+function comparePublishedProducts(left, right) {
+  return normalizeSortOrder(left?.sortOrder) - normalizeSortOrder(right?.sortOrder)
+    || Number(Boolean(right?.popular)) - Number(Boolean(left?.popular))
+    || (productSellPrice(left) ?? Number.POSITIVE_INFINITY) - (productSellPrice(right) ?? Number.POSITIVE_INFINITY)
+    || String(left?.sku || "").localeCompare(String(right?.sku || ""));
+}
+
+function publishedProducts() {
+  return state.products
+    .filter((product) => product.published === true)
+    .sort(comparePublishedProducts);
+}
+
+function resetPublishedOrderFromProducts(preferredOrder = []) {
+  const products = publishedProducts();
+  const publishedSkus = new Set(products.map((product) => String(product.sku)));
+  const seen = new Set();
+  const orderedSkus = [];
+  for (const sku of Array.isArray(preferredOrder) ? preferredOrder : []) {
+    const normalizedSku = String(sku || "");
+    if (!publishedSkus.has(normalizedSku) || seen.has(normalizedSku)) continue;
+    seen.add(normalizedSku);
+    orderedSkus.push(normalizedSku);
+  }
+  for (const product of products) {
+    const sku = String(product.sku);
+    if (seen.has(sku)) continue;
+    seen.add(sku);
+    orderedSkus.push(sku);
+  }
+  state.publishedOrder = orderedSkus;
+  state.savedPublishedOrder = [...state.publishedOrder];
+  state.draggedPublishedSku = "";
+  renderPublishedProducts();
+}
+
+function publishedOrderIsDirty() {
+  return state.publishedOrder.length !== state.savedPublishedOrder.length
+    || state.publishedOrder.some((sku, index) => sku !== state.savedPublishedOrder[index]);
+}
+
+function publishedProductsInOrder() {
+  const bySku = new Map(publishedProducts().map((product) => [String(product.sku), product]));
+  return state.publishedOrder.map((sku) => bySku.get(String(sku))).filter(Boolean);
+}
+
+function publishedProductAvailability(product) {
+  if (product.storefrontVisible === true) {
+    return { sellable: true, label: "前台可售", reason: "用户可正常购买" };
+  }
+  if (product.active !== true) {
+    return { sellable: false, label: "暂不可售", reason: product.unavailableReason || "供应商当前不可用" };
+  }
+  if (!["airtime", "data"].includes(String(product.category || ""))) {
+    return { sellable: false, label: "暂不可售", reason: "尚未选择话费或流量分类" };
+  }
+  if (!String(product.operator || "").trim() || String(product.operator).trim() === "未知运营商") {
+    return { sellable: false, label: "暂不可售", reason: "尚未填写运营商" };
+  }
+  if ((product.sourceEligible ?? product.eligible) !== true && product.manualCatalogApproved !== true) {
+    return { sellable: false, label: "暂不可售", reason: product.excludeReason || "尚未确认是印尼通信套餐" };
+  }
+  if (productSellPrice(product) === null) {
+    return { sellable: false, label: "暂不可售", reason: product.autoPriceReason || "售价尚未生成" };
+  }
+  return { sellable: false, label: "暂不可售", reason: "当前未通过前台可售校验" };
+}
+
+function publishedProductRow(product, index, total) {
+  const category = product.category === "data" ? "流量套餐" : product.category === "airtime" ? "话费充值" : "待分类";
+  const availability = publishedProductAvailability(product);
+  return `<tr class="published-order-row" data-sku="${escapeHtml(product.sku)}" draggable="true">
+    <td><span class="rank-number">${index + 1}</span></td>
+    <td><button class="drag-handle" type="button" aria-label="拖动 ${escapeHtml(product.name || product.sku)}" title="按住拖动">⠿</button></td>
+    <td><div class="sku-title">${escapeHtml(product.name || product.sku)}</div><div class="subline">${escapeHtml(product.sku)}</div></td>
+    <td><div>${escapeHtml(product.operator || "未知运营商")}</div><span class="category-badge ${escapeHtml(product.category || "airtime")}">${category}</span></td>
+    <td class="money">${escapeHtml(formatMoney(productSellPrice(product)))}</td>
+    <td><span class="sale-state ${availability.sellable ? "sellable" : "unavailable"}">${availability.label}</span><div class="sale-reason">${escapeHtml(availability.reason)}</div></td>
+    <td>${product.popular ? '<span class="status-badge popular">热门推荐</span>' : '<span class="subline">普通展示</span>'}</td>
+    <td><div class="order-buttons"><button class="mini-button move-published" type="button" data-delta="-1" ${index === 0 ? "disabled" : ""}>上移</button><button class="mini-button move-published" type="button" data-delta="1" ${index === total - 1 ? "disabled" : ""}>下移</button></div></td>
+  </tr>`;
+}
+
+function clearPublishedDropIndicators() {
+  $$(".published-order-row").forEach((row) => row.classList.remove("drop-before", "drop-after"));
+}
+
+function setPublishedOrder(nextOrder) {
+  state.publishedOrder = nextOrder;
+  renderPublishedProducts();
+}
+
+function movePublishedProduct(sku, delta) {
+  const index = state.publishedOrder.indexOf(String(sku));
+  const target = index + Number(delta);
+  if (index < 0 || target < 0 || target >= state.publishedOrder.length) return;
+  const next = [...state.publishedOrder];
+  [next[index], next[target]] = [next[target], next[index]];
+  setPublishedOrder(next);
+}
+
+function dropPublishedProduct(sourceSku, targetSku, after) {
+  if (!sourceSku || !targetSku || sourceSku === targetSku) return;
+  const next = state.publishedOrder.filter((sku) => sku !== sourceSku);
+  const targetIndex = next.indexOf(targetSku);
+  if (targetIndex < 0) return;
+  next.splice(targetIndex + (after ? 1 : 0), 0, sourceSku);
+  setPublishedOrder(next);
+}
+
+function renderPublishedProducts() {
+  const products = publishedProductsInOrder();
+  const sellableCount = products.filter((product) => product.storefrontVisible === true).length;
+  const unavailableCount = products.length - sellableCount;
+  $("#publishedOrderCount").textContent = products.length.toLocaleString("zh-CN");
+  $("#publishedSellableCount").textContent = sellableCount.toLocaleString("zh-CN");
+  $("#publishedUnavailableCount").textContent = unavailableCount.toLocaleString("zh-CN");
+  const warning = $("#publishedOrderWarning");
+  warning.hidden = unavailableCount === 0;
+  warning.innerHTML = unavailableCount === 0 ? "" : `<strong>${unavailableCount} 个已设置上架的套餐暂不可售</strong><span>具体原因已逐行标明；可到商品中心补全配置。</span><button class="text-link go-products" type="button">前往商品中心</button>`;
+  $("#publishedOrderRows").innerHTML = products.length
+    ? products.map((product, index) => publishedProductRow(product, index, products.length)).join("")
+    : '<tr><td colspan="8" class="empty-state">暂无已设置上架的套餐，请先到商品中心选择商品上架</td></tr>';
+
+  const dirty = publishedOrderIsDirty();
+  const saveButton = $("#savePublishedOrder");
+  saveButton.disabled = !dirty || products.length === 0;
+  const stateLabel = $("#publishedOrderState");
+  stateLabel.textContent = dirty ? "有未保存调整" : "顺序已保存";
+  stateLabel.className = `order-save-state ${dirty ? "dirty" : "saved"}`;
+  $("#resetPublishedOrder").disabled = !dirty;
+
+  $$(".move-published", $("#publishedOrderRows")).forEach((button) => button.addEventListener("click", () => {
+    movePublishedProduct(button.closest("tr").dataset.sku, button.dataset.delta);
+  }));
+  $$(".published-order-row", $("#publishedOrderRows")).forEach((row) => {
+    row.addEventListener("dragstart", (event) => {
+      state.draggedPublishedSku = row.dataset.sku;
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", row.dataset.sku);
+      requestAnimationFrame(() => row.classList.add("dragging"));
+    });
+    row.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      clearPublishedDropIndicators();
+      row.classList.add(event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2 ? "drop-after" : "drop-before");
+    });
+    row.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const after = event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
+      dropPublishedProduct(state.draggedPublishedSku || event.dataTransfer.getData("text/plain"), row.dataset.sku, after);
+      state.draggedPublishedSku = "";
+      clearPublishedDropIndicators();
+      $$(".published-order-row").forEach((item) => item.classList.remove("dragging"));
+    });
+    row.addEventListener("dragend", () => {
+      state.draggedPublishedSku = "";
+      clearPublishedDropIndicators();
+      row.classList.remove("dragging");
+    });
+  });
+  const goProducts = $(".go-products", warning);
+  if (goProducts) goProducts.addEventListener("click", () => switchSection("products"));
+}
+
+async function savePublishedOrder() {
+  const button = $("#savePublishedOrder");
+  if (!publishedOrderIsDirty()) return;
+  setButtonBusy(button, true, "保存中…");
+  try {
+    await api("/api/admin/products/order", {
+      method: "PUT",
+      body: JSON.stringify({ skus: state.publishedOrder, expectedRevision: state.orderRevision })
+    });
+    notify("前台商品顺序已保存");
+    await Promise.all([loadProducts(), loadAudit()]);
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+    button.disabled = !publishedOrderIsDirty() || state.publishedOrder.length === 0;
+  }
+}
+
 function productRow(product) {
   const active = product.active !== false;
   const sourceEligible = (product.sourceEligible ?? product.eligible) === true;
@@ -155,7 +353,7 @@ function productRow(product) {
     <td><div class="cost">${product.buyPriceIdr == null ? "—" : Number(product.buyPriceIdr).toLocaleString("zh-CN")}</div><div class="subline">IDR</div></td>
     <td><input class="table-input name-input product-name" maxlength="120" value="${escapeHtml(product.name || product.sku)}" aria-label="前台名称"><br><input class="table-input description-input product-description" maxlength="500" value="${escapeHtml(product.description || "")}" placeholder="套餐说明" aria-label="套餐说明"></td>
     <td><select class="table-select price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select><br><input class="table-input price-input product-price" type="number" min="0.01" step="0.01" value="${price == null ? "" : escapeHtml(Number(price).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="${automatic && price == null ? escapeHtml(autoPriceReason) : "售价"}"><div class="subline">${automatic && price == null ? escapeHtml(autoPriceReason) : "人民币"}</div></td>
-    <td><input class="table-input sort-input product-sort" type="number" min="-9999" max="9999" step="1" value="${escapeHtml(product.sortOrder ?? 0)}" aria-label="排序"><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label><label class="display-controls approval-control"><input class="product-manual-approval" type="checkbox" ${sourceEligible || product.manualCatalogApproved ? "checked" : ""} ${sourceEligible ? "disabled" : ""}> ${sourceEligible ? "系统已识别" : "确认是印尼通信套餐"}</label></td>
+    <td><label class="display-controls"><input class="product-popular" type="checkbox" ${product.popular ? "checked" : ""}> 热门推荐</label><div class="subline">排序请到“上架商品”页面调整</div><label class="display-controls approval-control"><input class="product-manual-approval" type="checkbox" ${sourceEligible || product.manualCatalogApproved ? "checked" : ""} ${sourceEligible ? "disabled" : ""}> ${sourceEligible ? "系统已识别" : "确认是印尼通信套餐"}</label></td>
     <td><label class="switch" title="${active ? "设置上架状态" : "供应商不可用，无法上架"}"><input class="product-published" type="checkbox" ${product.published ? "checked" : ""} ${active ? "" : "disabled"}><span class="slider"></span></label></td>
     <td><button class="save-button save-product">保存</button></td>
   </tr>`;
@@ -229,7 +427,6 @@ async function saveProduct(event) {
     priceMode,
     popular: $(".product-popular", row).checked,
     manualCatalogApproved: sourceEligible ? Boolean(product?.manualCatalogApproved) : approvalInput.checked,
-    sortOrder: Number($(".product-sort", row).value || 0),
     published: $(".product-published", row).checked
   };
   if (!payload.name) return notify("前台商品名称不能为空", "error");
@@ -258,6 +455,8 @@ async function saveProduct(event) {
 async function loadProducts() {
   const data = await api("/api/admin/products");
   state.products = Array.isArray(data.products) ? data.products : [];
+  const serverPublishedOrder = data.publishedOrder && typeof data.publishedOrder === "object" ? data.publishedOrder : {};
+  state.orderRevision = serverPublishedOrder.revision ?? "";
   const validSkus = new Set(state.products.map((product) => String(product.sku)));
   state.selectedSkus = new Set([...state.selectedSkus].filter((sku) => validSkus.has(sku)));
   const selectedOperator = $("#operatorFilter").value;
@@ -265,6 +464,7 @@ async function loadProducts() {
   $("#operatorFilter").innerHTML = '<option value="all">全部运营商</option>' + operators.map((operator) => `<option value="${escapeHtml(operator)}">${escapeHtml(operator)}</option>`).join("");
   if (operators.includes(selectedOperator)) $("#operatorFilter").value = selectedOperator;
   renderProducts();
+  resetPublishedOrderFromProducts(serverPublishedOrder.skus);
 }
 
 async function loadFx() {
@@ -403,6 +603,7 @@ function auditLabel(action) {
     "products.sync": "同步供应商商品",
     "products.bulk_publish": "批量上架商品",
     "products.bulk_unpublish": "批量下架商品",
+    "products.reorder": "调整前台商品顺序",
     "product.update": "修改商品设置",
     "fx.refresh": "刷新在线汇率",
     "fx.manual_update": "手动修改汇率",
@@ -415,6 +616,7 @@ function summarizeAudit(details) {
   const parts = [];
   if (details.sku) parts.push(`SKU ${details.sku}`);
   if (details.changed !== undefined) parts.push(`更新 ${details.changed} 项`);
+  if (details.count !== undefined) parts.push(`排序 ${details.count} 项`);
   if (details.eligibleCount !== undefined) parts.push(`通信商品 ${details.eligibleCount} 项`);
   if (details.supplierCount !== undefined) parts.push(`供应商返回 ${details.supplierCount} 项`);
   if (details.idrPerCny !== undefined) parts.push(`汇率 ${details.idrPerCny}`);
@@ -476,11 +678,12 @@ async function switchSection(section) {
   state.section = section;
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.section === section));
   $$(".section").forEach((element) => element.classList.toggle("active", element.id === `section-${section}`));
-  const titles = { products: "商品中心", orders: "订单中心", system: "系统状态" };
+  const titles = { products: "商品中心", published: "上架商品", orders: "订单中心", system: "系统状态" };
   $("#pageTitle").textContent = titles[section] || "运营后台";
   closeMobileMenu();
   try {
     if (section === "orders") await loadOrders();
+    if (section === "published") renderPublishedProducts();
     if (section === "system") await loadSystem();
   } catch (error) {
     notify(error.message, "error");
@@ -531,6 +734,8 @@ function bindEvents() {
   $("#productNext").addEventListener("click", () => { state.productPage += 1; renderProducts(); });
   $("#bulkPublish").addEventListener("click", () => bulkSetPublished(true));
   $("#bulkUnpublish").addEventListener("click", () => bulkSetPublished(false));
+  $("#savePublishedOrder").addEventListener("click", savePublishedOrder);
+  $("#resetPublishedOrder").addEventListener("click", () => setPublishedOrder([...state.savedPublishedOrder]));
   $("#syncProducts").addEventListener("click", runProductSync);
   $("#refreshFx").addEventListener("click", refreshFx);
   $("#orderSearch").addEventListener("input", renderOrders);

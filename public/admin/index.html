@@ -14,6 +14,7 @@
       <p class="nav-label">业务管理</p>
       <nav class="admin-nav" aria-label="后台导航">
         <button class="nav-item active" data-section="products"><span>▦</span>商品中心</button>
+        <button class="nav-item" data-section="published"><span>↕</span>上架商品</button>
         <button class="nav-item" data-section="orders"><span>◫</span>订单中心</button>
       </nav>
       <p class="nav-label">系统</p>
@@ -68,11 +69,43 @@
           </div>
           <div class="table-scroll">
             <table class="data-table product-table">
-              <thead><tr><th class="check-column"></th><th>商品 / SKU</th><th>分类与状态</th><th>买入价</th><th>前台文案</th><th>销售定价</th><th>展示设置</th><th>上架</th><th>操作</th></tr></thead>
+              <thead><tr><th class="check-column"></th><th>商品 / SKU</th><th>分类与状态</th><th>买入价</th><th>前台文案</th><th>销售定价</th><th>推荐与识别</th><th>上架</th><th>操作</th></tr></thead>
               <tbody id="productRows"><tr><td colspan="9" class="empty-state">正在加载商品…</td></tr></tbody>
             </table>
           </div>
           <div class="panel-footer"><span id="productResultCount">0 个结果</span><div class="pagination"><button class="mini-button" id="productPrev">上一页</button><span id="productPageInfo">第 1 / 1 页</span><button class="mini-button" id="productNext">下一页</button></div><span>全部 SKU 都会保留；只有完成分类、运营商和必要人工确认的商品才能上架</span></div>
+        </section>
+      </section>
+
+      <section class="admin-content section" id="section-published">
+        <div class="page-heading">
+          <div><p class="kicker">STOREFRONT ORDER</p><h1>上架商品与前台排序</h1><p>这里展示全部已设置上架的套餐；暂不可售商品会保留并标明原因，可售商品按此顺序出现在前台。</p></div>
+          <div class="heading-actions"><a class="button secondary" href="/" target="_blank" rel="noopener">打开前台预览</a><button class="button secondary" id="resetPublishedOrder">恢复已保存顺序</button><button class="button primary" id="savePublishedOrder" disabled>保存前台排序</button></div>
+        </div>
+
+        <div class="published-summary">
+          <div class="published-counts">
+            <div><span class="published-count" id="publishedOrderCount">0</span><span>个已设置上架</span></div>
+            <div><span class="published-count sellable" id="publishedSellableCount">0</span><span>个前台可售</span></div>
+            <div><span class="published-count unavailable" id="publishedUnavailableCount">0</span><span>个暂不可售</span></div>
+          </div>
+          <div class="published-help"><strong>调整方法</strong><span>拖动行，或使用右侧的上移 / 下移按钮</span></div>
+          <span class="order-save-state saved" id="publishedOrderState">顺序已保存</span>
+        </div>
+
+        <div class="published-warning" id="publishedOrderWarning" hidden></div>
+        <section class="admin-panel published-order-panel">
+          <div class="published-order-head">
+            <div><strong>前台商品队列</strong><span>排序值由系统统一维护，不需要手填数字</span></div>
+            <span>“热门”只显示推荐标签，不会覆盖这里的顺序</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table published-order-table">
+              <thead><tr><th>序号</th><th class="drag-column">拖动</th><th>商品 / SKU</th><th>运营商与类型</th><th>前台售价</th><th>可售状态</th><th>展示标签</th><th>调整</th></tr></thead>
+              <tbody id="publishedOrderRows"><tr><td colspan="8" class="empty-state">正在加载上架商品…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="panel-footer"><span>保存后刷新前台即可看到可售商品的新顺序</span><span>新上架套餐会自动追加；暂不可售商品修复后会沿用当前位置</span></div>
         </section>
       </section>
 

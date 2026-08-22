@@ -9,6 +9,16 @@ import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrd
 import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
 import { createOrderStore } from "./src/order-store.js";
 import { supplierBuyPriceIdr, supplierProductAvailability, autoPriceState } from "./src/catalog-pricing.js";
+import {
+  appendCatalogDisplayOrder,
+  assignCatalogDisplayOrder,
+  catalogDisplaySkus,
+  catalogOrderRevision,
+  catalogSkuSetsMatch,
+  compareCatalogDisplayOrder,
+  normalizeCatalogOrderRequest,
+  normalizeCatalogSortOrder
+} from "./src/catalog-display.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(root, ".env");
@@ -359,15 +369,46 @@ function getSellPriceCny(product, fx) {
   return getAutoPriceCny(product, fx);
 }
 
+function isProductStorefrontVisible(product, fx) {
+  return Boolean(product?.published)
+    && product?.active === true
+    && productCanAppearInCatalog(product)
+    && getSellPriceCny(product, fx) !== null;
+}
+
 function adminProductView(product, fx) {
   const { raw: _raw, ...view } = product;
   const pricing = autoPriceState(product, fx);
   return {
     ...view,
+    sellPriceCny: getSellPriceCny(product, fx),
+    storefrontVisible: isProductStorefrontVisible(product, fx),
     autoPriceCny: pricing.priceCny,
     autoPriceStatus: pricing.status,
     autoPriceReason: pricing.reason
   };
+}
+
+function publishedCatalogOrder(products, fx) {
+  return catalogDisplaySkus(products
+    .filter((product) => Boolean(product?.published))
+    .map((product) => ({
+      id: String(product?.sku || ""),
+      sku: String(product?.sku || ""),
+      sortOrder: product?.sortOrder,
+      popular: Boolean(product?.popular),
+      price: getSellPriceCny(product, fx)
+    })));
+}
+
+function publishedCatalogOrderState(products, fx) {
+  const skus = publishedCatalogOrder(products, fx);
+  return { skus, revision: catalogOrderRevision(skus) };
+}
+
+function appendNewlyPublishedProducts(products, skus, fx) {
+  if (skus.length === 0) return publishedCatalogOrder(products, fx);
+  return appendCatalogDisplayOrder(products, publishedCatalogOrder(products, fx), skus);
 }
 
 async function refreshFxRate(source = "manual") {
@@ -646,7 +687,11 @@ async function adminApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/admin/products") {
     const products = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    return json(res, 200, { ok: true, products: products.map((product) => adminProductView(product, fx)) });
+    return json(res, 200, {
+      ok: true,
+      products: products.map((product) => adminProductView(product, fx)),
+      publishedOrder: publishedCatalogOrderState(products, fx)
+    });
   }
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync") {
     try {
@@ -661,19 +706,52 @@ async function adminApi(req, res, url) {
     const skus = [...new Set(Array.isArray(input.skus) ? input.skus.map(String) : [])].slice(0, 500);
     if (!skus.length || typeof input.published !== "boolean") return json(res, 400, { ok: false, message: "请选择商品并指定上架状态" });
     return withCatalogMutationLock(async () => {
-      const skuSet = new Set(skus);
       const products = await readJson(productsFile, []);
       const fx = await readJson(fxFile, null);
+      const productsBySku = new Map(products.map((product) => [String(product.sku), product]));
+      const selectedProducts = skus.map((sku) => productsBySku.get(sku)).filter(Boolean);
+      const eligibleProducts = selectedProducts.filter((product) => !input.published
+        || (product.active && productCanAppearInCatalog(product) && getSellPriceCny(product, fx) !== null));
+      const newlyPublishedSkus = input.published
+        ? eligibleProducts.filter((product) => !product.published).map((product) => String(product.sku))
+        : [];
+      try {
+        appendNewlyPublishedProducts(products, newlyPublishedSkus, fx);
+      } catch (error) {
+        return json(res, 409, { ok: false, message: error.message || "上架商品数量超过排序上限" });
+      }
       let changed = 0;
-      for (const product of products) {
-        if (!skuSet.has(product.sku)) continue;
-        if (input.published && (!product.active || !productCanAppearInCatalog(product) || getSellPriceCny(product, fx) === null)) continue;
+      for (const product of eligibleProducts) {
         product.published = input.published;
         changed += 1;
       }
       await writeJson(productsFile, products);
       await appendAudit(input.published ? "products.bulk_publish" : "products.bulk_unpublish", { skus, changed });
-      return json(res, 200, { ok: true, changed });
+      return json(res, 200, { ok: true, changed, publishedOrder: publishedCatalogOrderState(products, fx) });
+    });
+  }
+  if (req.method === "PUT" && url.pathname === "/api/admin/products/order") {
+    let input;
+    try {
+      input = normalizeCatalogOrderRequest(JSON.parse(await readBody(req)));
+    } catch (error) {
+      return json(res, 400, { ok: false, message: error.message || "请求格式错误" });
+    }
+    const { skus, expectedRevision } = input;
+    return withCatalogMutationLock(async () => {
+      const products = await readJson(productsFile, []);
+      const fx = await readJson(fxFile, null);
+      const current = publishedCatalogOrderState(products, fx);
+      if (!catalogSkuSetsMatch(current.skus, skus)) {
+        return json(res, 409, { ok: false, message: "上架商品已发生变化，请刷新列表后重新排序", publishedOrder: current });
+      }
+      if (current.revision !== expectedRevision) {
+        return json(res, 409, { ok: false, message: "商品排序已被其他操作更新，请刷新后重试", publishedOrder: current });
+      }
+      assignCatalogDisplayOrder(products, skus);
+      await writeJson(productsFile, products);
+      await appendAudit("products.reorder", { count: skus.length, firstSkus: skus.slice(0, 10) });
+      return json(res, 200, { ok: true, order: skus, publishedOrder: publishedCatalogOrderState(products, fx) });
     });
   }
   if (req.method === "PUT" && url.pathname.startsWith("/api/admin/products/")) {
@@ -683,6 +761,8 @@ async function adminApi(req, res, url) {
       const products = await readJson(productsFile, []);
       const product = products.find((p) => p.sku === sku);
       if (!product) return json(res, 404, { ok: false, message: "SKU不存在" });
+      const fx = await readJson(fxFile, null);
+      const wasPublished = Boolean(product.published);
       const requestedPublished = typeof input.published === "boolean" ? input.published : product.published;
       if (typeof input.category === "string") {
         if (!["airtime", "data", "unclassified"].includes(input.category)) return json(res, 400, { ok: false, message: "商品分类无效" });
@@ -702,11 +782,6 @@ async function adminApi(req, res, url) {
       }
       if (typeof input.description === "string") product.description = input.description.slice(0, 500);
       if (typeof input.popular === "boolean") product.popular = input.popular;
-      if (input.sortOrder !== undefined) {
-        const sortOrder = Number(input.sortOrder);
-        if (!Number.isFinite(sortOrder)) return json(res, 400, { ok: false, message: "排序值无效" });
-        product.sortOrder = Math.max(-9999, Math.min(9999, Math.round(sortOrder)));
-      }
       if (input.priceMode === "auto" || input.priceMode === "manual") product.priceMode = input.priceMode;
       if (product.priceMode === "manual") {
         const manualPrice = Number(input.priceCny);
@@ -715,11 +790,18 @@ async function adminApi(req, res, url) {
       }
       if (requestedPublished && !product.active) return json(res, 400, { ok: false, message: "供应商已停用该商品，不能上架" });
       if (requestedPublished && !productCanAppearInCatalog(product)) return json(res, 400, { ok: false, message: "请先确认商品是印尼通信套餐，并完成分类和运营商设置" });
-      if (requestedPublished && getSellPriceCny(product, await readJson(fxFile, null)) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      if (requestedPublished && getSellPriceCny(product, fx) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      if (requestedPublished && !wasPublished) {
+        try {
+          appendNewlyPublishedProducts(products, [String(product.sku)], fx);
+        } catch (error) {
+          return json(res, 409, { ok: false, message: error.message || "上架商品数量超过排序上限" });
+        }
+      }
       product.published = requestedPublished;
       await writeJson(productsFile, products);
       await appendAudit("product.update", { sku, published: product.published, priceMode: product.priceMode, popular: product.popular, sortOrder: product.sortOrder });
-      return json(res, 200, { ok: true, product: adminProductView(product, await readJson(fxFile, null)) });
+      return json(res, 200, { ok: true, product: adminProductView(product, fx), publishedOrder: publishedCatalogOrderState(products, fx) });
     });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/fx") return json(res, 200, { ok: true, fx: await readJson(fxFile, null) });
@@ -813,7 +895,7 @@ async function handleApi(req, res, url) {
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
     const published = managed
-      .filter((product) => product.published && product.active && productCanAppearInCatalog(product))
+      .filter((product) => isProductStorefrontVisible(product, fx))
       .map((product) => ({
         id: product.sku,
         operator: product.operator,
@@ -824,10 +906,10 @@ async function handleApi(req, res, url) {
         price: getSellPriceCny(product, fx),
         currency: "CNY",
         popular: Boolean(product.popular),
-        sortOrder: Number(product.sortOrder || 0)
+        sortOrder: normalizeCatalogSortOrder(product.sortOrder)
       }))
       .filter((product) => Number.isFinite(product.price) && product.price > 0)
-      .sort((left, right) => right.popular - left.popular || left.sortOrder - right.sortOrder || left.price - right.price);
+      .sort(compareCatalogDisplayOrder);
     const allowDemo = process.env.NODE_ENV !== "production" && managed.length === 0;
     return json(res, 200, { ok: true, currency: "CNY", products: allowDemo ? catalog : published });
   }
