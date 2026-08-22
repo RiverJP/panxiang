@@ -104,9 +104,15 @@ function supplierProductItems(response) {
 function paginationContainers(response) {
   return [
     response?.data?.pagination,
+    response?.data?.paging,
+    response?.data?.page_info,
+    response?.data?.pageInfo,
     response?.data?.meta,
     response?.data,
     response?.pagination,
+    response?.paging,
+    response?.page_info,
+    response?.pageInfo,
     response?.meta,
     response
   ].filter((value) => value && typeof value === "object" && !Array.isArray(value));
@@ -115,33 +121,141 @@ function paginationContainers(response) {
 function paginationField(response, names) {
   for (const container of paginationContainers(response)) {
     for (const name of names) {
-      if (Object.hasOwn(container, name)) return { known: true, value: container[name] };
+      if (Object.hasOwn(container, name)) return { known: true, name, value: container[name] };
     }
   }
-  return { known: false, value: undefined };
+  return { known: false, name: "", value: undefined };
 }
 
-function supplierPagination(response) {
+function paginationNextLink(response) {
+  const linkContainers = [
+    response?.data?.pagination?.links,
+    response?.data?.paging?.links,
+    response?.data?.meta?.links,
+    response?.data?.links,
+    response?.pagination?.links,
+    response?.paging?.links,
+    response?.meta?.links,
+    response?.links
+  ].filter((value) => value && typeof value === "object" && !Array.isArray(value));
+  for (const container of linkContainers) {
+    if (Object.hasOwn(container, "next")) return { known: true, value: container.next };
+  }
+  return paginationField(response, ["next_url", "nextUrl", "next_link", "nextLink"]);
+}
+
+function positiveInteger(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function truthyPaginationFlag(field) {
+  const value = typeof field.value === "string" ? field.value.trim().toLowerCase() : field.value;
+  if ([true, 1, "1", "true", "yes"].includes(value)) return true;
+  if ([false, 0, "0", "false", "no"].includes(value)) return false;
+  return null;
+}
+
+function paginationScopeQuery(currentQuery) {
+  const query = { ...currentQuery };
+  for (const key of ["cursor", "token", "page_token", "pageToken", "page", "offset"]) delete query[key];
+  return query;
+}
+
+function queryFromNextLink(field, pathname) {
+  if (!field.known || field.value === null || field.value === undefined || field.value === "") return null;
+  const raw = typeof field.value === "object"
+    ? field.value.href || field.value.url || field.value.uri
+    : field.value;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const url = new URL(raw, `https://pagination.invalid${pathname}`);
+  if (url.pathname !== pathname) throw new Error(`供应商商品下一页链接路径异常（${url.pathname}）`);
+  return Object.fromEntries(url.searchParams.entries());
+}
+
+function supplierPagination(response, currentQuery, pathname = "/v1/products") {
   const cursorField = paginationField(response, ["next_cursor", "nextCursor"]);
+  const tokenField = paginationField(response, ["next_page_token", "nextPageToken", "next_token", "nextToken"]);
+  const nextPageField = paginationField(response, ["next_page", "nextPage"]);
+  const currentPageField = paginationField(response, ["current_page", "currentPage", "page"]);
+  const lastPageField = paginationField(response, ["last_page", "lastPage", "total_pages", "totalPages", "page_count", "pageCount", "pages"]);
+  const nextOffsetField = paginationField(response, ["next_offset", "nextOffset"]);
+  const offsetField = paginationField(response, ["offset", "current_offset", "currentOffset"]);
+  const limitField = paginationField(response, ["limit", "per_page", "perPage", "page_size", "pageSize"]);
+  const nextLinkField = paginationNextLink(response);
   const hasMoreField = paginationField(response, ["has_more", "hasMore"]);
   const totalField = paginationField(response, ["total", "total_count", "totalCount"]);
   const cursor = cursorField.value === null || cursorField.value === undefined || cursorField.value === ""
     ? ""
     : String(cursorField.value);
-  const normalizedHasMore = typeof hasMoreField.value === "string" ? hasMoreField.value.trim().toLowerCase() : hasMoreField.value;
-  const hasMore = [true, 1, "1", "true", "yes"].includes(normalizedHasMore)
-    ? true
-    : [false, 0, "0", "false", "no"].includes(normalizedHasMore)
-      ? false
-      : null;
-  const parsedTotal = Number(totalField.value);
-  const total = totalField.known && Number.isInteger(parsedTotal) && parsedTotal >= 0 ? parsedTotal : null;
+  const token = tokenField.value === null || tokenField.value === undefined || tokenField.value === ""
+    ? ""
+    : String(tokenField.value);
+  const hasMore = truthyPaginationFlag(hasMoreField);
+  const total = totalField.known ? positiveInteger(totalField.value) : null;
+  const scope = paginationScopeQuery(currentQuery);
+  let nextQuery = null;
+  let strategy = "unknown";
+
+  const linkedQuery = queryFromNextLink(nextLinkField, pathname);
+  if (hasMore !== false) {
+    if (linkedQuery) {
+      nextQuery = { ...scope, ...linkedQuery };
+      strategy = "link";
+    } else if (cursor) {
+      nextQuery = { ...scope, cursor };
+      strategy = "cursor";
+    } else if (token) {
+      const tokenQueryKey = tokenField.name === "nextPageToken"
+        ? "pageToken"
+        : tokenField.name === "next_page_token"
+          ? "page_token"
+          : "token";
+      nextQuery = { ...scope, [tokenQueryKey]: token };
+      strategy = "token";
+    } else {
+      const nextPage = positiveInteger(nextPageField.value);
+      const currentPage = positiveInteger(currentPageField.value);
+      const lastPage = positiveInteger(lastPageField.value);
+      const limit = positiveInteger(limitField.value);
+      const morePagesByTotal = currentPage !== null && limit && total !== null && currentPage * limit < total;
+      if (nextPage !== null) {
+        nextQuery = { ...scope, page: nextPage };
+        strategy = "page";
+      } else if (currentPage !== null && ((lastPage !== null && currentPage < lastPage) || (lastPage === null && (hasMore === true || morePagesByTotal)))) {
+        nextQuery = { ...scope, page: currentPage + 1 };
+        strategy = "page";
+      } else {
+        const nextOffset = positiveInteger(nextOffsetField.value);
+        const currentOffset = positiveInteger(offsetField.value);
+        const moreOffsetsByTotal = currentOffset !== null && limit && total !== null && currentOffset + limit < total;
+        if (nextOffset !== null) {
+          nextQuery = { ...scope, offset: nextOffset };
+          strategy = "offset";
+        } else if (currentOffset !== null && limit && (hasMore === true || moreOffsetsByTotal)) {
+          nextQuery = { ...scope, offset: currentOffset + limit };
+          strategy = "offset";
+        }
+      }
+    }
+  }
+
+  const terminalMarker = (nextLinkField.known && !linkedQuery)
+    || (cursorField.known && !cursor)
+    || (tokenField.known && !token)
+    || (nextPageField.known && positiveInteger(nextPageField.value) === null)
+    || (lastPageField.known
+      && positiveInteger(currentPageField.value) !== null
+      && positiveInteger(lastPageField.value) !== null
+      && positiveInteger(currentPageField.value) >= positiveInteger(lastPageField.value));
   return {
-    cursor,
-    cursorKnown: cursorField.known,
+    nextQuery,
+    strategy,
     hasMore,
     hasMoreKnown: hasMoreField.known && hasMore !== null,
-    total
+    total,
+    terminalMarker
   };
 }
 
@@ -153,7 +267,7 @@ function supplierPagination(response) {
  * type filter, but should only be used when ReloadN has enabled that behaviour
  * for the merchant account.
  */
-export async function listAllSupplierProducts() {
+export async function listAllSupplierProducts({ request = supplierRequest } = {}) {
   const types = [...new Set(String(process.env.SUPPLIER_PRODUCT_TYPES || "topup")
     .split(",")
     .map((value) => value.trim())
@@ -165,15 +279,19 @@ export async function listAllSupplierProducts() {
   if (!types.length) throw new Error("SUPPLIER_PRODUCT_TYPES 不能为空");
 
   for (const type of types) {
-    let cursor = "";
+    const wildcardType = ["all", "*"].includes(type.toLowerCase());
+    let query = wildcardType ? {} : { type };
     let fetched = 0;
     let expectedTotal = null;
     let complete = false;
-    const seenCursors = new Set();
+    const seenQueries = new Set();
+    const strategies = new Set();
     const typeSkus = new Set();
     for (let page = 0; page < 100; page += 1) {
-      const query = { ...(["all", "*"].includes(type.toLowerCase()) ? {} : { type }), ...(cursor ? { cursor } : {}) };
-      const response = await supplierRequest("GET", "/v1/products", query);
+      const queryKey = sortedQuery(query);
+      if (seenQueries.has(queryKey)) throw new Error(`供应商商品分页参数循环（type=${type}）`);
+      seenQueries.add(queryKey);
+      const response = await request("GET", "/v1/products", query);
       pages += 1;
       const items = supplierProductItems(response);
       for (const item of items) {
@@ -184,24 +302,30 @@ export async function listAllSupplierProducts() {
         }
       }
       fetched = typeSkus.size;
-      const pageInfo = supplierPagination(response);
+      const pageInfo = supplierPagination(response, query);
+      if (pageInfo.strategy !== "unknown") strategies.add(pageInfo.strategy);
       if (pageInfo.total !== null) expectedTotal = pageInfo.total;
-      if (!pageInfo.cursor) {
+      if (!pageInfo.nextQuery) {
         if (pageInfo.hasMoreKnown && pageInfo.hasMore === true) {
-          throw new Error(`供应商提示仍有下一页，但未返回分页游标（type=${type}）`);
+          throw new Error(`供应商提示仍有下一页，但未返回可识别的分页参数（type=${type}）`);
         } else {
           const explicitlyFinished = (pageInfo.hasMoreKnown && pageInfo.hasMore === false)
-            || (pageInfo.cursorKnown && (!pageInfo.hasMoreKnown || pageInfo.hasMore === false));
+            || pageInfo.terminalMarker;
           complete = expectedTotal !== null ? fetched >= expectedTotal : explicitlyFinished;
         }
         break;
       }
-      if (seenCursors.has(pageInfo.cursor)) throw new Error(`供应商商品分页游标循环（type=${type}）`);
+      if (!wildcardType) {
+        const linkedType = pageInfo.nextQuery.type;
+        if (linkedType !== undefined && String(linkedType) !== type) {
+          throw new Error(`供应商商品下一页链接改变了查询类型（${type} → ${linkedType}）`);
+        }
+        pageInfo.nextQuery.type = type;
+      }
       if (page === 99) throw new Error(`供应商商品超过 100 页，已停止同步（type=${type}）`);
-      seenCursors.add(pageInfo.cursor);
-      cursor = pageInfo.cursor;
+      query = pageInfo.nextQuery;
     }
-    pagination.push({ type, fetched, expectedTotal, complete });
+    pagination.push({ type, fetched, expectedTotal, complete, strategies: [...strategies] });
   }
 
   if (!bySku.size) throw new Error("供应商返回的商品目录为空，已保留现有商品数据");

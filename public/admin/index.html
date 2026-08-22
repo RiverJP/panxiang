@@ -37,7 +37,7 @@
         </div>
 
         <div class="stats-grid">
-          <article class="stat-card"><span>全部 SKU</span><strong id="statProducts">—</strong><small>供应商完整目录</small></article>
+          <article class="stat-card"><span>本地已保存 SKU</span><strong id="statProducts">—</strong><small>服务器当前保存总数</small></article>
           <article class="stat-card"><span>已上架</span><strong id="statPublished">—</strong><small>前台当前可购买</small></article>
           <article class="stat-card"><span>供应商不可用</span><strong id="statUnavailable">—</strong><small>已自动停止前台销售</small></article>
           <article class="stat-card"><span>IDR / CNY</span><strong id="statRate">—</strong><small id="statRateTime">等待汇率更新</small></article>
@@ -49,6 +49,15 @@
             <select id="categoryFilter"><option value="all">全部类型</option><option value="airtime">话费充值</option><option value="data">流量套餐</option><option value="unclassified">待分类 / 其他</option></select>
             <select id="operatorFilter"><option value="all">全部运营商</option></select>
             <select id="publishFilter"><option value="all">全部上架状态</option><option value="published">已上架</option><option value="hidden">未上架</option><option value="unavailable">供应商不可用</option></select>
+            <button class="mini-button clear-filter-button" id="clearProductFilters" type="button">清除筛选</button>
+          </div>
+          <div class="catalog-diagnostics" aria-label="商品同步诊断" aria-live="polite">
+            <span><b id="diagnosticFilteredCount">—</b> 当前筛选</span>
+            <span><b id="diagnosticLocalCount">—</b> 本地已保存</span>
+            <span><b id="diagnosticSupplierCount">—</b> 最近供应商返回</span>
+            <span>查询类型 <b id="diagnosticQueryTypes">—</b></span>
+            <span>请求页数 <b id="diagnosticPages">—</b></span>
+            <span>目录完整性 <b id="diagnosticCompleteness" class="sync-completeness unknown">尚未同步</b></span>
           </div>
           <div class="bulk-bar">
             <label><input type="checkbox" id="selectAll"> 选择当前页</label>
@@ -92,7 +101,7 @@
           </section>
           <section class="admin-panel settings-card">
             <div class="card-title"><div><h2>供应商同步</h2><p>每天检查一次完整 SKU 目录并跟随分页游标。</p></div><span class="status-badge success">已启用</span></div>
-            <dl class="detail-list"><div><dt>最近完成</dt><dd id="syncCompleted">—</dd></div><div><dt>全部 SKU</dt><dd id="syncSupplierCount">—</dd></div><div><dt>自动识别通信套餐</dt><dd id="syncEligibleCount">—</dd></div><div><dt>自动同步</dt><dd>每 24 小时</dd></div></dl>
+            <dl class="detail-list"><div><dt>最近完成</dt><dd id="syncCompleted">—</dd></div><div><dt>最近供应商返回</dt><dd id="syncSupplierCount">—</dd></div><div><dt>自动识别通信套餐</dt><dd id="syncEligibleCount">—</dd></div><div><dt>查询类型</dt><dd id="syncQueryTypes">—</dd></div><div><dt>请求页数</dt><dd id="syncPages">—</dd></div><div><dt>目录完整性</dt><dd id="syncCompleteness">—</dd></div><div><dt>自动同步</dt><dd>每 24 小时</dd></div></dl>
           </section>
         </div>
         <section class="admin-panel audit-panel"><div class="card-title"><div><h2>最近操作</h2><p>保留最近 1,000 条商品、汇率及同步操作记录。</p></div></div><div id="auditList" class="audit-list"><div class="empty-state">正在加载记录…</div></div></section>

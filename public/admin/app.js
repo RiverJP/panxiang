@@ -105,6 +105,41 @@ function pagedProducts(filtered = currentFilteredProducts()) {
   return { items: filtered.slice(start, start + state.productPageSize), totalPages };
 }
 
+function productFiltersActive() {
+  return Boolean(
+    $("#productSearch").value.trim()
+    || $("#categoryFilter").value !== "all"
+    || $("#operatorFilter").value !== "all"
+    || $("#publishFilter").value !== "all"
+  );
+}
+
+function formatSyncTypes(types) {
+  if (!Array.isArray(types) || !types.length) return "—";
+  return types.map((type) => ["all", "*"].includes(String(type).toLowerCase()) ? "all（无类型筛选）" : String(type)).join("、");
+}
+
+function syncCompleteness(sync) {
+  if (!sync || !sync.completedAt) return { text: "尚未同步", className: "unknown" };
+  return sync.catalogComplete === true
+    ? { text: "已确认完整", className: "complete" }
+    : { text: "未确认完整", className: "incomplete" };
+}
+
+function renderProductDiagnostics(filteredCount = currentFilteredProducts().length) {
+  const sync = state.status?.sync || null;
+  const completeness = syncCompleteness(sync);
+  $("#diagnosticFilteredCount").textContent = Number(filteredCount).toLocaleString("zh-CN");
+  $("#diagnosticLocalCount").textContent = state.products.length.toLocaleString("zh-CN");
+  $("#diagnosticSupplierCount").textContent = sync?.supplierCount == null ? "—" : Number(sync.supplierCount).toLocaleString("zh-CN");
+  $("#diagnosticQueryTypes").textContent = formatSyncTypes(sync?.queriedTypes);
+  $("#diagnosticPages").textContent = sync?.pages == null ? "—" : Number(sync.pages).toLocaleString("zh-CN");
+  const completenessElement = $("#diagnosticCompleteness");
+  completenessElement.textContent = completeness.text;
+  completenessElement.className = `sync-completeness ${completeness.className}`;
+  $("#clearProductFilters").disabled = !productFiltersActive();
+}
+
 function productRow(product) {
   const active = product.active !== false;
   const sourceEligible = (product.sourceEligible ?? product.eligible) === true;
@@ -145,13 +180,14 @@ function renderProducts() {
   $("#statProducts").textContent = state.products.length.toLocaleString("zh-CN");
   $("#statPublished").textContent = state.products.filter((product) => product.published && product.active !== false).length.toLocaleString("zh-CN");
   $("#statUnavailable").textContent = state.products.filter((product) => product.active === false).length.toLocaleString("zh-CN");
-  $("#productResultCount").textContent = `${filtered.length.toLocaleString("zh-CN")} 个结果，每页最多 ${state.productPageSize} 个`;
+  $("#productResultCount").textContent = `当前筛选 ${filtered.length.toLocaleString("zh-CN")} / 本地 ${state.products.length.toLocaleString("zh-CN")}，每页最多 ${state.productPageSize} 个`;
   $("#productPageInfo").textContent = `第 ${state.productPage} / ${page.totalPages} 页`;
   $("#productPrev").disabled = state.productPage <= 1;
   $("#productNext").disabled = state.productPage >= page.totalPages;
   $("#productRows").innerHTML = products.length
     ? products.map(productRow).join("")
     : '<tr><td colspan="9" class="empty-state">没有符合当前筛选条件的 SKU</td></tr>';
+  renderProductDiagnostics(filtered.length);
 
   $$(".row-select", $("#productRows")).forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
@@ -402,6 +438,10 @@ async function loadSystemStatus() {
   $("#syncCompleted").textContent = formatDate(sync.completedAt);
   $("#syncSupplierCount").textContent = sync.supplierCount == null ? "—" : Number(sync.supplierCount).toLocaleString("zh-CN");
   $("#syncEligibleCount").textContent = sync.eligibleCount == null ? "—" : Number(sync.eligibleCount).toLocaleString("zh-CN");
+  $("#syncQueryTypes").textContent = formatSyncTypes(sync.queriedTypes);
+  $("#syncPages").textContent = sync.pages == null ? "—" : Number(sync.pages).toLocaleString("zh-CN");
+  $("#syncCompleteness").textContent = syncCompleteness(sync).text;
+  renderProductDiagnostics();
   const foot = $(".sidebar-foot");
   if (foot) foot.innerHTML = '<span class="health-dot"></span>生产服务运行中';
   if (status.fx) {
@@ -472,6 +512,14 @@ async function logout() {
 function bindEvents() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchSection(button.dataset.section)));
   ["#productSearch", "#categoryFilter", "#operatorFilter", "#publishFilter"].forEach((selector) => $(selector).addEventListener("input", () => { state.productPage = 1; renderProducts(); }));
+  $("#clearProductFilters").addEventListener("click", () => {
+    $("#productSearch").value = "";
+    $("#categoryFilter").value = "all";
+    $("#operatorFilter").value = "all";
+    $("#publishFilter").value = "all";
+    state.productPage = 1;
+    renderProducts();
+  });
   $("#selectAll").addEventListener("change", (event) => {
     pagedProducts().items.forEach((product) => {
       const sku = String(product.sku);
