@@ -329,7 +329,10 @@ function normalizeSupplierProduct(item) {
   const blocked = blockedProductPattern.test(text);
   const sourceEligible = Boolean(sku && countryOk && inferredOperator && ["airtime", "data"].includes(category) && !blocked);
   const buyPriceIdr = supplierBuyPriceIdr(item, { allowUndeclaredGeneric: sourceEligible });
-  const availability = supplierProductAvailability(item);
+  // ReloadN's product catalogue does not guarantee a separate availability
+  // field. A product present in the current catalogue is therefore sellable
+  // unless the supplier explicitly marks it unavailable.
+  const availability = supplierProductAvailability(item, { listedProductsDefaultActive: true });
   const name = String(item.name || item.title || item.product_name || sku);
   return {
     sku,

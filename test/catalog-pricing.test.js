@@ -30,8 +30,20 @@ test("products returned without a status remain unavailable until their real sta
   });
 });
 
-test("explicit inactive status remains unavailable", () => {
-  assert.equal(supplierProductAvailability({ status: "inactive" }).active, false);
+test("products present in the supplier catalogue default to available when status is omitted", () => {
+  assert.deepEqual(supplierProductAvailability({ sku: "TK2K" }, { listedProductsDefaultActive: true }), {
+    active: true,
+    statusKnown: false,
+    unavailableReason: "供应商未单独返回状态，按当前产品目录视为可用"
+  });
+});
+
+test("explicit inactive status remains unavailable in catalogue mode", () => {
+  assert.deepEqual(supplierProductAvailability({ status: "inactive" }, { listedProductsDefaultActive: true }), {
+    active: false,
+    statusKnown: true,
+    unavailableReason: "供应商标记为不可用"
+  });
 });
 
 test("calculates automatic CNY price from a current IDR/CNY rate", () => {
