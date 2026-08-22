@@ -28,7 +28,7 @@
     </section>
     <section class="login-pane">
       <div class="login-wrap">
-        <div class="login-top"><strong>运营管理中心</strong><a href="/">返回充值首页</a></div>
+        <div class="login-top"><strong>运营管理中心</strong><span class="hint">仅限授权人员</span></div>
         <form class="login-card" id="loginForm" novalidate>
           <h2>登录运营后台</h2>
           <p class="lead">使用管理员账号、图片验证码和 Google 动态验证码继续。</p>
@@ -78,7 +78,7 @@
       const button=$("#submitButton");button.disabled=true;button.textContent="正在验证…";
       try{
         const response=await fetch("/api/admin/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("#username").value.trim(),password:$("#password").value,captchaId,captchaCode:$("#captchaCode").value.trim(),totpCode:$("#totpCode").value.trim()})});
-        const data=await response.json();if(!response.ok)throw Error(data.message||"登录失败");location.replace("/admin.html");
+        const data=await response.json();if(!response.ok)throw Error(data.message||"登录失败");location.replace("/admin/");
       }catch(error){showError(error.message);$("#totpCode").value="";await refreshCaptcha();$("#totpCode").focus()}
       finally{button.disabled=false;button.textContent="安全登录"}
     };

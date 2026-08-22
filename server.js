@@ -1,17 +1,19 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrder, verifyWebhookSignature, listSupplierProducts } from "./src/provider.js";
+import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrder, querySupplierOrder, verifyWebhookSignature, listAllSupplierProducts } from "./src/provider.js";
 import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
+import { createOrderStore } from "./src/order-store.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
+const envFile = path.join(root, ".env");
+if (existsSync(envFile)) process.loadEnvFile(envFile);
 const publicDir = path.join(root, "public");
 const port = Number(process.env.PORT || 3000);
-const orders = new Map();
-const webhookIds = new Set();
 const wechatStates = new Map();
 const wechatSessions = new Map();
 const adminSessions = new Map();
@@ -22,6 +24,24 @@ const adminCookieName = "__Host-px_admin_session";
 const dataDir = path.join(root, "data");
 const productsFile = path.join(dataDir, "products.json");
 const fxFile = path.join(dataDir, "fx.json");
+const ordersFile = path.join(dataDir, "orders.json");
+const syncMetaFile = path.join(dataDir, "sync-meta.json");
+const auditFile = path.join(dataDir, "admin-audit.json");
+const orderStore = createOrderStore({ dbPath: path.join(dataDir, "orders.sqlite"), legacyJsonPath: ordersFile });
+const rechargeLocks = new Set();
+let catalogMutationTail = Promise.resolve();
+
+async function withCatalogMutationLock(work) {
+  const previous = catalogMutationTail;
+  let release;
+  catalogMutationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await fs.readFile(file, "utf8")); } catch { return fallback; }
@@ -29,7 +49,15 @@ async function readJson(file, fallback) {
 
 async function writeJson(file, value) {
   await fs.mkdir(dataDir, { recursive: true });
-  await fs.writeFile(file, JSON.stringify(value, null, 2));
+  const temporary = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify(value, null, 2));
+  await fs.rename(temporary, file);
+}
+
+async function appendAudit(action, details = {}) {
+  const entries = await readJson(auditFile, []);
+  entries.push({ action, details, at: new Date().toISOString() });
+  await writeJson(auditFile, entries.slice(-1000));
 }
 
 function parseCookies(req) {
@@ -222,18 +250,143 @@ function recordLoginFailure(ip) {
   adminLoginAttempts.set(ip, attempt);
 }
 
-function normalizeSupplierProduct(item) {
+const telecomOperators = [
+  { canonical: "Telkomsel", aliases: /telkomsel|simpati|kartu\s*as|by\.?u/i, sku: /^TK\d/i },
+  { canonical: "Indosat", aliases: /indosat|im3|mentari/i, sku: /^(IS|IM3)\d/i },
+  { canonical: "XL", aliases: /\bxl\b|xl\s*axiata/i, sku: /^XL\d/i },
+  { canonical: "AXIS", aliases: /\baxis\b/i, sku: /^AX\d/i },
+  { canonical: "Tri", aliases: /\btri\b|three|3\s*indonesia/i, sku: /^(TRI|THREE)\d/i },
+  { canonical: "Smartfren", aliases: /smartfren/i, sku: /^SF\d/i }
+];
+const blockedProductPattern = /game|gaming|gift\s*card|steam|google\s*play|pln|listrik|e-?wallet|\bdana\b|\bovo\b|gopay|shopee\s*pay|television|\btv\b|streaming|insurance|bpjs/i;
+const dataProductPattern = /\bdata\b|internet|kuota|quota|paket|package|combo|unlimited|\d+(?:[.,]\d+)?\s*(?:gb|mb)\b/i;
+const airtimeProductPattern = /top\s*up|topup|pulsa|airtime|reload|phone\s*credit|saldo/i;
+const unsupportedTelecomPattern = /sms\s*only|sms\s*package|voice\s*only|telepon\s*only/i;
+
+function productText(item) {
+  return [item.sku, item.code, item.product_code, item.name, item.product_name, item.title, item.description, item.operator, item.telco, item.provider, item.brand, item.network, item.type, item.product_type, item.service_type, item.kind, item.category, item.subcategory]
+    .filter((value) => value !== null && value !== undefined)
+    .join(" ");
+}
+
+function inferSupplierOperator(item) {
   const sku = String(item.sku || item.code || item.product_code || item.id || "");
-  const idr = Number(item.buy_price_idr ?? item.cost_idr ?? item.price_idr ?? item.price ?? item.amount);
-  return { sku, operator: item.operator || item.telco || item.provider || "", kind: item.type || item.kind || "流量", name: item.name || item.title || sku, buyPriceIdr: Number.isFinite(idr) ? idr : null, active: item.active !== false && item.status !== "inactive", raw: item };
+  const text = productText(item);
+  return telecomOperators.find((definition) => definition.sku.test(sku))?.canonical
+    || telecomOperators.find((definition) => definition.aliases.test(text))?.canonical
+    || "";
+}
+
+function inferSupplierCategory(item, operator) {
+  if (!operator) return "unclassified";
+  const text = productText(item);
+  if (blockedProductPattern.test(text) || unsupportedTelecomPattern.test(text)) return "unclassified";
+  if (dataProductPattern.test(text)) return "data";
+  if (airtimeProductPattern.test(text)) return "airtime";
+  const structuredType = String(item.type || item.product_type || item.service_type || item.kind || item.category || item.subcategory || "").toLowerCase();
+  if (["data", "internet", "quota", "package"].some((value) => structuredType.includes(value))) return "data";
+  if (["topup", "airtime", "pulsa", "reload"].some((value) => structuredType.includes(value))) return "airtime";
+  if (/^(TK|IS|IM3|XL|AX|TRI|THREE|SF)\d/i.test(String(item.sku || item.code || ""))) return "airtime";
+  return "unclassified";
+}
+
+function indonesiaCountryMatches(item, operator) {
+  const values = [item.country_code, item.countryCode, item.country, item.iso_country, item.isoCountry]
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .map((value) => String(value).trim());
+  if (!values.length) return Boolean(operator);
+  return values.some((value) => /^(ID|IDN|360|62|\+62)$/i.test(value) || /indonesia/i.test(value));
+}
+
+function numericIdr(value) {
+  const parsed = Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function supplierCurrency(item) {
+  const value = item.currency
+    ?? item.currency_code
+    ?? item.currencyCode
+    ?? item.buy_currency
+    ?? item.buyCurrency
+    ?? item.cost_currency
+    ?? item.costCurrency
+    ?? item.price?.currency
+    ?? item.price?.currency_code
+    ?? item.price?.currencyCode;
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function supplierBuyPriceIdr(item) {
+  const declaredCurrency = supplierCurrency(item);
+  const currencyIsIdr = ["IDR", "RP", "RUPIAH", "INDONESIAN RUPIAH"].includes(declaredCurrency);
+  if (declaredCurrency && !currencyIsIdr) return null;
+
+  const explicitlyIdr = item.buy_price_idr
+    ?? item.buyPriceIdr
+    ?? item.cost_idr
+    ?? item.costIdr
+    ?? item.price_idr
+    ?? item.priceIdr;
+  if (explicitlyIdr !== null && explicitlyIdr !== undefined && explicitlyIdr !== "") return numericIdr(explicitlyIdr);
+  if (!currencyIsIdr) return null;
+
+  return numericIdr(item.buy_price
+    ?? item.buyPrice
+    ?? item.cost
+    ?? item.price?.amount
+    ?? (typeof item.price === "object" ? null : item.price));
+}
+
+function supplierProductActive(item) {
+  const unavailable = new Set([
+    "0", "false", "no", "off", "inactive", "disabled", "offline", "suspended", "unavailable",
+    "maintenance", "maintaining", "out_of_stock", "out-of-stock", "out of stock", "sold_out", "sold-out", "sold out", "closed"
+  ]);
+  const available = new Set(["1", "true", "yes", "on", "active", "enabled", "online", "available", "ready", "live", "open", "in_stock", "in-stock", "in stock"]);
+  const candidates = [item.active, item.enabled, item.available, item.status, item.state, item.product_status, item.productStatus, item.availability]
+    .filter((value) => value !== null && value !== undefined && value !== "")
+    .map((value) => String(value).trim().toLowerCase());
+  if (!candidates.length || candidates.some((value) => unavailable.has(value))) return false;
+  return candidates.every((value) => available.has(value));
+}
+
+function normalizeSupplierProduct(item) {
+  const sku = String(item.sku || item.code || item.product_code || item.id || "").trim();
+  const operator = inferSupplierOperator(item);
+  const category = inferSupplierCategory(item, operator);
+  const text = productText(item);
+  const countryOk = indonesiaCountryMatches(item, operator);
+  const blocked = blockedProductPattern.test(text);
+  const buyPriceIdr = supplierBuyPriceIdr(item);
+  const active = supplierProductActive(item);
+  const eligible = Boolean(sku && countryOk && operator && ["airtime", "data"].includes(category) && !blocked);
+  const name = String(item.name || item.title || item.product_name || sku);
+  return {
+    sku,
+    countryCode: "ID",
+    operator,
+    category,
+    kind: category === "airtime" ? "话费" : category === "data" ? "流量" : "待分类",
+    name,
+    buyPriceIdr,
+    active,
+    eligible,
+    excludeReason: eligible ? "" : !countryOk ? "非印尼商品" : !operator ? "无法识别印尼运营商" : blocked ? "非通信充值商品" : "无法识别为话费或流量套餐",
+    raw: item
+  };
 }
 
 function getAutoPriceCny(product, fx) {
   if (product?.buyPriceIdr === null || product?.buyPriceIdr === undefined || product?.buyPriceIdr === "" || fx?.idrPerCny === null || fx?.idrPerCny === undefined || fx?.idrPerCny === "") return null;
+  const fxAge = Date.now() - Date.parse(fx.updatedAt || 0);
+  const maxFxAgeHours = Number(process.env.MAX_FX_AGE_HOURS || 24);
+  if (!Number.isFinite(fxAge) || fxAge < 0 || fxAge > maxFxAgeHours * 60 * 60 * 1000) return null;
   const buyPriceIdr = Number(product.buyPriceIdr);
   const idrPerCny = Number(fx.idrPerCny);
   if (!Number.isFinite(buyPriceIdr) || !Number.isFinite(idrPerCny) || idrPerCny <= 0) return null;
-  return Math.max(0, Number(((buyPriceIdr - 120) / idrPerCny).toFixed(2)));
+  const calculated = Number(((buyPriceIdr - 120) / idrPerCny).toFixed(2));
+  return Number.isFinite(calculated) && calculated > 0 ? calculated : null;
 }
 
 function getSellPriceCny(product, fx) {
@@ -243,6 +396,204 @@ function getSellPriceCny(product, fx) {
     return Number.isFinite(manualPrice) && manualPrice > 0 ? manualPrice : null;
   }
   return getAutoPriceCny(product, fx);
+}
+
+async function refreshFxRate(source = "manual") {
+  const fxUrl = process.env.FX_RATE_URL || "https://open.er-api.com/v6/latest/CNY";
+  const response = await fetch(fxUrl, { signal: AbortSignal.timeout(10000) });
+  if (!response.ok) throw new Error(`汇率服务返回 ${response.status}`);
+  const data = await response.json();
+  const idrPerCny = Number(data?.rates?.IDR);
+  const minRate = Number(process.env.FX_IDR_CNY_MIN || 1000);
+  const maxRate = Number(process.env.FX_IDR_CNY_MAX || 5000);
+  if (!Number.isFinite(idrPerCny) || idrPerCny < minRate || idrPerCny > maxRate) throw new Error("汇率响应超出安全范围，未更新自动售价");
+  const previous = await readJson(fxFile, null);
+  const previousRate = Number(previous?.idrPerCny);
+  const maxChangeRatio = Number(process.env.FX_MAX_CHANGE_RATIO || 0.15);
+  if (Number.isFinite(previousRate) && previousRate > 0 && Math.abs(idrPerCny / previousRate - 1) > maxChangeRatio) {
+    throw new Error("汇率变动超过安全阈值，需在后台人工确认");
+  }
+  const fx = { idrPerCny, source: fxUrl, updateMode: "automatic", trigger: source, updatedAt: new Date().toISOString() };
+  await writeJson(fxFile, fx);
+  return fx;
+}
+
+async function syncSupplierCatalog(source = "manual") {
+  return withCatalogMutationLock(async () => {
+    if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) throw new Error("供应商 API 未配置");
+    const response = await listAllSupplierProducts();
+    const old = await readJson(productsFile, []);
+    const oldBySku = new Map(old.map((product) => [product.sku, product]));
+    const now = new Date().toISOString();
+    const normalized = response.items.map(normalizeSupplierProduct);
+    const eligible = normalized.filter((product) => product.eligible);
+    const returnedBySku = new Map(normalized.filter((product) => product.sku).map((product) => [product.sku, product]));
+    const previousEligible = old.filter((product) => product.eligible !== false && product.active !== false);
+    const minimumRetentionRatio = Number(process.env.CATALOG_MIN_RETENTION_RATIO || 0.25);
+    if (!eligible.length) throw new Error("本次同步未识别出话费或流量套餐，已保留现有商品数据");
+    if (response.complete && previousEligible.length >= 20 && eligible.length / previousEligible.length < minimumRetentionRatio) {
+      throw new Error(`本次通信商品数量异常下降（${previousEligible.length} → ${eligible.length}），已取消同步`);
+    }
+    const seen = new Set(eligible.map((product) => product.sku));
+    const products = eligible.map((fresh) => {
+      const previous = oldBySku.get(fresh.sku) || {};
+      return {
+        ...fresh,
+        description: previous.description || fresh.name,
+        priceMode: previous.priceMode === "manual" ? "manual" : "auto",
+        ...(previous.priceCny !== undefined ? { priceCny: previous.priceCny } : {}),
+        published: Boolean(previous.published && fresh.active),
+        popular: Boolean(previous.popular),
+        sortOrder: Number.isFinite(Number(previous.sortOrder)) ? Number(previous.sortOrder) : 0,
+        firstSeenAt: previous.firstSeenAt || now,
+        lastSeenAt: now,
+        syncedAt: now
+      };
+    });
+    for (const previous of old) {
+      if (seen.has(previous.sku)) continue;
+      const returned = returnedBySku.get(previous.sku);
+      if (returned) {
+        products.push({ ...previous, active: false, published: false, unavailableReason: returned.excludeReason || "供应商商品不再符合通信套餐规则", syncedAt: now });
+      } else {
+        products.push(response.complete
+          ? { ...previous, active: false, published: false, unavailableReason: "供应商完整目录未返回该商品", syncedAt: now }
+          : { ...previous });
+      }
+    }
+    products.sort((left, right) => left.operator.localeCompare(right.operator) || left.category.localeCompare(right.category) || left.sku.localeCompare(right.sku));
+    const meta = {
+      source,
+      startedAt: now,
+      completedAt: new Date().toISOString(),
+      pages: response.pages,
+      queriedTypes: response.types,
+      catalogComplete: Boolean(response.complete),
+      pagination: response.pagination,
+      supplierCount: response.items.length,
+      eligibleCount: eligible.length,
+      excludedCount: normalized.length - eligible.length,
+      unavailableCount: products.filter((product) => !product.active).length
+    };
+    await writeJson(productsFile, products);
+    await writeJson(syncMetaFile, meta);
+    await appendAudit("products.sync", meta);
+    return { products, meta };
+  });
+}
+
+function supplierOrderFromResponse(provider) {
+  return provider?.data?.data?.order
+    || provider?.data?.data?.items?.[0]
+    || provider?.data?.data?.orders?.[0]
+    || provider?.data?.order
+    || provider?.data?.items?.[0]
+    || null;
+}
+
+function supplierStatusToLocal(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (["success", "successful", "completed", "complete"].includes(normalized)) return "recharge_success";
+  if (["failed", "failure", "cancelled", "canceled", "rejected"].includes(normalized)) return "refund_required";
+  if (["refunded", "refund"].includes(normalized)) return "refund_required";
+  return "recharge_processing";
+}
+
+function safeErrorDetails(error) {
+  const details = error?.details && typeof error.details === "object" ? error.details : {};
+  return {
+    message: String(error?.message || "供应商请求失败").slice(0, 300),
+    code: String(details.code || details.error_code || "").slice(0, 100),
+    supplierMessage: String(details.message || details.error || "").slice(0, 300)
+  };
+}
+
+function retryableSupplierError(error) {
+  const status = Number(String(error?.message || "").match(/Supplier API (\d+)/)?.[1]);
+  return !Number.isFinite(status) || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function nextRetryAt(retryCount, baseMinutes = 2) {
+  const minutes = Math.min(60, baseMinutes * (2 ** Math.min(Math.max(retryCount - 1, 0), 5)));
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+async function processRecharge(orderId, { force = false } = {}) {
+  if (rechargeLocks.has(orderId)) return { skipped: "locked" };
+  rechargeLocks.add(orderId);
+  try {
+    const order = orderStore.getOrder(orderId);
+    if (!order) return { skipped: "not_found" };
+    if (!force && order.nextRetryAt && Date.parse(order.nextRetryAt) > Date.now()) return { skipped: "not_due" };
+    if (!force && !["paid_pending_recharge", "recharge_processing"].includes(order.status)) return { skipped: "status" };
+    if (force && !["paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status)) return { skipped: "status" };
+
+    const shouldQuery = order.status === "recharge_processing" || Boolean(order.providerOrderId);
+    const provider = shouldQuery
+      ? await querySupplierOrder(order.id)
+      : await createSupplierOrder({ order, product: { id: order.productId, sku: order.productId } });
+    const providerOrder = supplierOrderFromResponse(provider);
+    const localStatus = supplierStatusToLocal(providerOrder?.status || provider.status);
+    const patch = {
+      status: localStatus,
+      provider,
+      providerOrderId: providerOrder?.order_id || providerOrder?.id || order.providerOrderId,
+      retryCount: localStatus === "recharge_processing" ? Number(order.retryCount || 0) : 0,
+      nextRetryAt: localStatus === "recharge_processing" ? new Date(Date.now() + 10 * 60 * 1000).toISOString() : null,
+      lastProviderError: null,
+      needsManualAction: localStatus === "refund_required",
+      updatedAt: new Date().toISOString()
+    };
+    return orderStore.updateOrder(order.id, patch, {
+      expectedStatuses: ["paid_pending_recharge", "recharge_processing", "manual_review"]
+    });
+  } catch (error) {
+    const order = orderStore.getOrder(orderId);
+    if (!order) throw error;
+    if (!["paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status)) {
+      return { skipped: "status_changed", order };
+    }
+    const retryCount = Number(order.retryCount || 0) + 1;
+    const retryable = retryableSupplierError(error) && retryCount <= 8;
+    orderStore.updateOrder(order.id, {
+      status: retryable ? "paid_pending_recharge" : "manual_review",
+      retryCount,
+      nextRetryAt: retryable ? nextRetryAt(retryCount) : null,
+      lastProviderError: safeErrorDetails(error),
+      needsManualAction: !retryable,
+      updatedAt: new Date().toISOString()
+    }, { expectedStatuses: ["paid_pending_recharge", "recharge_processing", "manual_review"] });
+    return { error: safeErrorDetails(error), retryable };
+  } finally {
+    rechargeLocks.delete(orderId);
+  }
+}
+
+async function processPendingRecharges() {
+  const candidates = [
+    ...orderStore.listOrders({ status: "paid_pending_recharge", limit: 1000 }),
+    ...orderStore.listOrders({ status: "recharge_processing", limit: 1000 })
+  ]
+    .filter((order) => !order.nextRetryAt || Date.parse(order.nextRetryAt) <= Date.now())
+    .sort((left, right) => Date.parse(left.nextRetryAt || left.createdAt || 0) - Date.parse(right.nextRetryAt || right.createdAt || 0))
+    .slice(0, 20);
+  for (const order of candidates) await processRecharge(order.id);
+}
+
+function publicOrder(order) {
+  if (!order) return null;
+  const phone = String(order.phone || "");
+  return {
+    id: order.id,
+    status: order.status,
+    phone: phone.length > 7 ? `${phone.slice(0, 5)}****${phone.slice(-3)}` : "***",
+    productId: order.productId,
+    productLabel: order.productLabel,
+    price: order.price,
+    currency: order.currency,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt || order.createdAt
+  };
 }
 
 async function adminApi(req, res, url) {
@@ -305,42 +656,119 @@ async function adminApi(req, res, url) {
     return json(res, 200, { ok: true, products: products.map((product) => ({ ...product, autoPriceCny: getAutoPriceCny(product, fx) })) });
   }
   if (req.method === "POST" && url.pathname === "/api/admin/products/sync") {
-    if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) return json(res, 503, { ok: false, message: "供应商 API 未配置" });
-    const response = await listSupplierProducts();
-    const items = response?.data?.items || response?.data?.products || response?.items || response?.products || [];
-    const old = await readJson(productsFile, []);
-    const oldBySku = new Map(old.map((p) => [p.sku, p]));
-    const products = items.map(normalizeSupplierProduct).filter((p) => p.sku).map((p) => ({ ...p, ...(oldBySku.get(p.sku) || {}), ...p }));
-    await writeJson(productsFile, products);
-    return json(res, 200, { ok: true, count: products.length, products });
+    try {
+      const result = await syncSupplierCatalog("manual");
+      return json(res, 200, { ok: true, count: result.products.length, meta: result.meta });
+    } catch (error) {
+      return json(res, 502, { ok: false, message: error.message || "供应商商品同步失败" });
+    }
+  }
+  if (req.method === "POST" && url.pathname === "/api/admin/products/bulk") {
+    let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    const skus = [...new Set(Array.isArray(input.skus) ? input.skus.map(String) : [])].slice(0, 500);
+    if (!skus.length || typeof input.published !== "boolean") return json(res, 400, { ok: false, message: "请选择商品并指定上架状态" });
+    return withCatalogMutationLock(async () => {
+      const skuSet = new Set(skus);
+      const products = await readJson(productsFile, []);
+      const fx = await readJson(fxFile, null);
+      let changed = 0;
+      for (const product of products) {
+        if (!skuSet.has(product.sku)) continue;
+        if (input.published && (!product.active || getSellPriceCny(product, fx) === null)) continue;
+        product.published = input.published;
+        changed += 1;
+      }
+      await writeJson(productsFile, products);
+      await appendAudit(input.published ? "products.bulk_publish" : "products.bulk_unpublish", { skus, changed });
+      return json(res, 200, { ok: true, changed });
+    });
   }
   if (req.method === "PUT" && url.pathname.startsWith("/api/admin/products/")) {
     let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
     const sku = decodeURIComponent(url.pathname.split("/").pop());
-    const products = await readJson(productsFile, []);
-    const product = products.find((p) => p.sku === sku);
-    if (!product) return json(res, 404, { ok: false, message: "SKU不存在" });
-    if (typeof input.published === "boolean") product.published = input.published;
-    if (typeof input.description === "string") product.description = input.description.slice(0, 500);
-    if (input.priceMode === "auto" || input.priceMode === "manual") product.priceMode = input.priceMode;
-    if (product.priceMode === "manual") {
-      const manualPrice = Number(input.priceCny);
-      if (input.priceCny === "" || !Number.isFinite(manualPrice) || manualPrice <= 0) return json(res, 400, { ok: false, message: "请输入有效的手动售价" });
-      product.priceCny = manualPrice;
-    }
-    await writeJson(productsFile, products);
-    return json(res, 200, { ok: true, product });
+    return withCatalogMutationLock(async () => {
+      const products = await readJson(productsFile, []);
+      const product = products.find((p) => p.sku === sku);
+      if (!product) return json(res, 404, { ok: false, message: "SKU不存在" });
+      if (typeof input.published === "boolean") {
+        if (input.published && !product.active) return json(res, 400, { ok: false, message: "供应商已停用该商品，不能上架" });
+        product.published = input.published;
+      }
+      if (typeof input.name === "string" && input.name.trim()) product.name = input.name.trim().slice(0, 120);
+      if (typeof input.description === "string") product.description = input.description.slice(0, 500);
+      if (typeof input.popular === "boolean") product.popular = input.popular;
+      if (input.sortOrder !== undefined) {
+        const sortOrder = Number(input.sortOrder);
+        if (!Number.isFinite(sortOrder)) return json(res, 400, { ok: false, message: "排序值无效" });
+        product.sortOrder = Math.max(-9999, Math.min(9999, Math.round(sortOrder)));
+      }
+      if (input.priceMode === "auto" || input.priceMode === "manual") product.priceMode = input.priceMode;
+      if (product.priceMode === "manual") {
+        const manualPrice = Number(input.priceCny);
+        if (input.priceCny === "" || !Number.isFinite(manualPrice) || manualPrice <= 0) return json(res, 400, { ok: false, message: "请输入有效的手动售价" });
+        product.priceCny = manualPrice;
+      }
+      if (product.published && getSellPriceCny(product, await readJson(fxFile, null)) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      await writeJson(productsFile, products);
+      await appendAudit("product.update", { sku, published: product.published, priceMode: product.priceMode, popular: product.popular, sortOrder: product.sortOrder });
+      return json(res, 200, { ok: true, product });
+    });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/fx") return json(res, 200, { ok: true, fx: await readJson(fxFile, null) });
   if (req.method === "POST" && url.pathname === "/api/admin/fx/refresh") {
-    const fxUrl = process.env.FX_RATE_URL || "https://open.er-api.com/v6/latest/CNY";
-    const response = await fetch(fxUrl, { signal: AbortSignal.timeout(10000) });
-    const data = await response.json();
-    const idrPerCny = Number(data?.rates?.IDR);
-    if (!Number.isFinite(idrPerCny)) return json(res, 502, { ok: false, message: "汇率响应中没有 IDR" });
-    const fx = { idrPerCny, source: fxUrl, updatedAt: new Date().toISOString() };
+    try {
+      const fx = await refreshFxRate("manual");
+      await appendAudit("fx.refresh", { idrPerCny: fx.idrPerCny });
+      return json(res, 200, { ok: true, fx });
+    } catch (error) {
+      return json(res, 502, { ok: false, message: error.message || "汇率刷新失败" });
+    }
+  }
+  if (req.method === "PUT" && url.pathname === "/api/admin/fx") {
+    let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    const idrPerCny = Number(input.idrPerCny);
+    const minRate = Number(process.env.FX_IDR_CNY_MIN || 1000);
+    const maxRate = Number(process.env.FX_IDR_CNY_MAX || 5000);
+    if (!Number.isFinite(idrPerCny) || idrPerCny < minRate || idrPerCny > maxRate) return json(res, 400, { ok: false, message: `汇率需在 ${minRate}–${maxRate} IDR/CNY 范围内` });
+    const fx = { idrPerCny, source: "manual", updateMode: "manual", updatedAt: new Date().toISOString() };
     await writeJson(fxFile, fx);
+    await appendAudit("fx.manual_update", { idrPerCny });
     return json(res, 200, { ok: true, fx });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/orders") {
+    return json(res, 200, { ok: true, orders: orderStore.listOrders({ limit: 2000 }) });
+  }
+  if (req.method === "POST" && /^\/api\/admin\/orders\/[^/]+\/retry$/.test(url.pathname)) {
+    const orderId = decodeURIComponent(url.pathname.split("/").at(-2));
+    const order = orderStore.getOrder(orderId);
+    if (!order) return json(res, 404, { ok: false, message: "订单不存在" });
+    if (!["paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status)) {
+      return json(res, 400, { ok: false, message: "当前订单状态不允许重新提交" });
+    }
+    const result = await processRecharge(orderId, { force: true });
+    await appendAudit("order.retry", { orderId, status: orderStore.getOrder(orderId)?.status });
+    return json(res, 200, { ok: true, result, order: orderStore.getOrder(orderId) });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/status") {
+    const products = await readJson(productsFile, []);
+    const fx = await readJson(fxFile, null);
+    const sync = await readJson(syncMetaFile, null);
+    return json(res, 200, {
+      ok: true,
+      status: {
+        products: products.length,
+        published: products.filter((product) => product.published && product.active).length,
+        unavailable: products.filter((product) => !product.active).length,
+        orders: orderStore.listOrders({ limit: 2000 }).length,
+        fx,
+        sync,
+        schedules: { productSyncHours: 24, fxRefreshHours: 8 }
+      }
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/api/admin/audit") {
+    const entries = await readJson(auditFile, []);
+    return json(res, 200, { ok: true, entries: entries.slice(-200).reverse() });
   }
   return json(res, 404, { ok: false, message: "管理接口不存在" });
 }
@@ -376,31 +804,55 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    const published = managed.filter((p) => p.published).map((p) => ({ ...p, id: p.sku, label: p.name || p.sku, popular: false, price: getSellPriceCny(p, fx) })).filter((p) => Number.isFinite(p.price));
-    return json(res, 200, { ok: true, currency: "CNY", products: published.length ? published : catalog });
+    const published = managed
+      .filter((product) => product.published && product.active && product.eligible !== false)
+      .map((product) => ({
+        id: product.sku,
+        operator: product.operator,
+        kind: product.kind,
+        category: product.category,
+        label: product.name || product.sku,
+        description: product.description || "",
+        price: getSellPriceCny(product, fx),
+        currency: "CNY",
+        popular: Boolean(product.popular),
+        sortOrder: Number(product.sortOrder || 0)
+      }))
+      .filter((product) => Number.isFinite(product.price) && product.price > 0)
+      .sort((left, right) => right.popular - left.popular || left.sortOrder - right.sortOrder || left.price - right.price);
+    const allowDemo = process.env.NODE_ENV !== "production" && managed.length === 0;
+    return json(res, 200, { ok: true, currency: "CNY", products: allowDemo ? catalog : published });
   }
   if (req.method === "GET" && url.pathname.startsWith("/api/orders/")) {
-    const order = orders.get(url.pathname.split("/").pop());
-    return order ? json(res, 200, { ok: true, order }) : json(res, 404, { ok: false, message: "订单不存在" });
+    const order = orderStore.getOrder(url.pathname.split("/").pop());
+    if (!order) return json(res, 404, { ok: false, message: "订单不存在" });
+    const token = String(url.searchParams.get("token") || "");
+    const cookie = String(req.headers.cookie || "").split(";").map((value) => value.trim()).find((value) => value.startsWith("px_wechat_session="));
+    const sessionId = cookie?.slice("px_wechat_session=".length);
+    const openid = wechatSessions.get(sessionId)?.openid;
+    const ownsOrder = (token && safeEqualText(token, order.lookupToken)) || (openid && safeEqualText(openid, order.payerOpenid));
+    return ownsOrder ? json(res, 200, { ok: true, order: publicOrder(order) }) : json(res, 403, { ok: false, message: "无权查看该订单" });
   }
   if (req.method === "POST" && url.pathname === "/api/orders") {
     let input;
     try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
     const managed = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
-    const managedItem = managed.find((p) => p.sku === input.productId && p.published);
-    const product = managedItem ? { ...managedItem, id: managedItem.sku, label: managedItem.name || managedItem.sku, price: getSellPriceCny(managedItem, fx) } : findProduct(input.productId);
+    const managedItem = managed.find((product) => product.sku === input.productId && product.published && product.active && product.eligible !== false);
+    const demoProduct = process.env.NODE_ENV !== "production" && managed.length === 0 ? findProduct(input.productId) : null;
+    const product = managedItem ? { ...managedItem, id: managedItem.sku, label: managedItem.name || managedItem.sku, price: getSellPriceCny(managedItem, fx), currency: "CNY" } : demoProduct;
     const phone = normalizePhone(input.phone);
     const detectedOperator = detectOperator(phone);
     if (!product) return json(res, 400, { ok: false, message: "套餐不存在" });
     if (!validPhone(phone)) return json(res, 400, { ok: false, message: "请输入有效的印尼手机号，例如 +62812xxxxxxx 或 0812xxxxxxx" });
     if (detectedOperator && detectedOperator !== product.operator) return json(res, 400, { ok: false, message: `该手机号段识别为 ${detectedOperator}，请选择对应套餐` });
     const id = `PX${Date.now()}${crypto.randomBytes(3).toString("hex")}`;
-    const order = { id, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt: new Date().toISOString() };
-    orders.set(id, order);
+    const lookupToken = crypto.randomBytes(24).toString("base64url");
+    const order = { id, lookupToken, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt: new Date().toISOString() };
     // 供应商下单必须在微信支付成功后执行，避免用户未付款却触发真实充值。
     order.status = "pending_payment";
-    return json(res, 201, { ok: true, order, next: "wechat_jsapi_payment" });
+    const created = orderStore.createOrder(order);
+    return json(res, 201, { ok: true, order: publicOrder(created), lookupToken, next: "wechat_jsapi_payment" });
   }
   if (req.method === "GET" && url.pathname === "/api/wechat/oauth/start") {
     if (!process.env.WECHAT_APPID || !process.env.WECHAT_APP_SECRET) return json(res, 503, { ok: false, message: "微信 AppID 或 AppSecret 未配置" });
@@ -431,7 +883,7 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "POST" && url.pathname === "/api/wechat/prepay") {
     let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
-    const order = orders.get(String(input.orderId || ""));
+    const order = orderStore.getOrder(String(input.orderId || ""));
     if (!order || order.status !== "pending_payment") return json(res, 400, { ok: false, message: "订单不存在或状态不允许支付" });
     const cookie = String(req.headers.cookie || "").split(";").map((v) => v.trim()).find((v) => v.startsWith("px_wechat_session="));
     const session = cookie?.slice("px_wechat_session=".length);
@@ -440,25 +892,52 @@ async function handleApi(req, res, url) {
     const amountFen = Math.round(Number(order.price) * 100);
     if (!Number.isFinite(amountFen) || amountFen <= 0) return json(res, 400, { ok: false, message: "订单金额无效" });
     const data = await createJsapiPrepay({ description: order.productLabel.slice(0, 120), outTradeNo: order.id, amountFen, openid });
-    order.status = "payment_pending";
-    order.prepayId = data.prepay_id;
-    order.updatedAt = new Date().toISOString();
+    const update = orderStore.updateOrder(order.id, { status: "payment_pending", prepayId: data.prepay_id, payerOpenid: openid, updatedAt: new Date().toISOString() }, { expectedStatuses: "pending_payment" });
+    if (!update.updated) {
+      const current = update.order;
+      if (current?.status === "payment_pending" && current.prepayId) {
+        return json(res, 200, { ok: true, orderId: current.id, payment: await buildJsapiPayParams(current.prepayId), replay: true });
+      }
+      return json(res, 409, { ok: false, message: "订单状态已变化，请刷新后查看订单状态" });
+    }
     return json(res, 200, { ok: true, orderId: order.id, payment: await buildJsapiPayParams(data.prepay_id) });
   }
   if (req.method === "POST" && url.pathname === "/api/wechat/notify") {
     const raw = await readBody(req);
     const payment = await verifyAndDecryptNotification(raw, req.headers);
-    const order = orders.get(String(payment.out_trade_no || ""));
-    if (!order) return json(res, 200, { code: "SUCCESS", message: "订单已处理" });
+    const order = orderStore.getOrder(String(payment.out_trade_no || ""));
+    if (!order) return json(res, 500, { code: "FAIL", message: "本地订单不存在，请稍后重试" });
     const expectedFen = Math.round(Number(order.price) * 100);
-    if (payment.trade_state !== "SUCCESS" || Number(payment.amount?.total) !== expectedFen) return json(res, 400, { code: "FAIL", message: "支付状态或金额不匹配" });
-    if (order.status === "recharge_processing" || order.status === "recharge_success") return json(res, 200, { code: "SUCCESS", message: "成功" });
-    const product = findProduct(order.productId) || { id: order.productId, sku: order.productId };
-    const provider = await createSupplierOrder({ order, product });
-    order.status = "recharge_processing";
-    order.payment = payment;
-    order.provider = provider;
-    order.updatedAt = new Date().toISOString();
+    const payerOpenid = String(payment.payer?.openid || "");
+    const identityMatches = safeEqualText(payment.appid, process.env.WECHAT_APPID)
+      && safeEqualText(payment.mchid, process.env.WECHAT_MCHID)
+      && safeEqualText(payment.amount?.currency, "CNY")
+      && (!order.payerOpenid || safeEqualText(payerOpenid, order.payerOpenid));
+    if (!identityMatches || payment.trade_state !== "SUCCESS" || Number(payment.amount?.total) !== expectedFen) {
+      return json(res, 400, { code: "FAIL", message: "支付身份、状态或金额不匹配" });
+    }
+    if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review"].includes(order.status)) return json(res, 200, { code: "SUCCESS", message: "成功" });
+    const transactionId = String(payment.transaction_id || "");
+    if (!transactionId) return json(res, 400, { code: "FAIL", message: "微信支付流水号缺失" });
+    const update = orderStore.updateOrder(order.id, {
+      status: "paid_pending_recharge",
+      transactionId,
+      payerOpenid: payerOpenid || order.payerOpenid,
+      paidAt: payment.success_time || new Date().toISOString(),
+      paymentSummary: { transactionId, amountFen: Number(payment.amount?.total), tradeState: payment.trade_state },
+      retryCount: Number(order.retryCount || 0),
+      nextRetryAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }, { expectedStatuses: ["pending_payment", "payment_pending"] });
+    if (!update.updated) {
+      if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review", "refunded"].includes(update.order?.status)) {
+        return json(res, 200, { code: "SUCCESS", message: "成功" });
+      }
+      return json(res, 409, { code: "FAIL", message: "订单状态冲突，请稍后重试" });
+    }
+    setImmediate(() => processRecharge(order.id).catch((error) => {
+      console.error(`Recharge processing failed for ${order.id}:`, error.message);
+    }));
     return json(res, 200, { code: "SUCCESS", message: "成功" });
   }
   if (req.method === "POST" && url.pathname === "/api/provider/webhook") {
@@ -467,37 +946,50 @@ async function handleApi(req, res, url) {
     let event;
     try { event = JSON.parse(raw); } catch { return json(res, 400, { ok: false, message: "webhook格式错误" }); }
     const webhookId = String(req.headers["x-webhook-id"] || "");
-    if (webhookIds.has(webhookId)) return json(res, 200, { ok: true, duplicate: true });
-    webhookIds.add(webhookId);
-    const orderId = event.client_order_id || event.order_id;
-    const order = orders.get(orderId);
-    if (order) {
-      const eventType = event.type || event.event_type;
-      order.status = eventType === "order.success" ? "recharge_success" : eventType === "order.failed" ? "recharge_failed" : eventType === "order.refunded" ? "refunded" : "processing";
-      order.provider = event;
-      order.orderVersion = Number(event.order_version || order.orderVersion || 0);
-      order.updatedAt = new Date().toISOString();
-    }
-    return json(res, 200, { ok: true });
+    const payloadOrder = event?.data?.order || event?.order || event?.data || event;
+    const eventType = String(event.type || event.event_type || payloadOrder.event_type || "");
+    if (eventType === "test.ping") return json(res, 200, { ok: true, ping: true });
+    const status = eventType === "order.success" ? "recharge_success"
+      : eventType === "order.failed" ? "refund_required"
+      : eventType === "order.refunded" ? "refunded"
+      : null;
+    const result = orderStore.applyProviderWebhook({
+      webhookId,
+      outTradeNo: payloadOrder.client_order_id || event.client_order_id,
+      providerOrderId: payloadOrder.order_id || payloadOrder.id || event.order_id,
+      orderVersion: payloadOrder.order_version ?? event.order_version,
+      eventType,
+      ...(status ? { status } : {}),
+      payload: event,
+      patch: status ? { nextRetryAt: null, needsManualAction: status === "refund_required" } : {}
+    });
+    return json(res, 200, { ok: true, duplicate: result.reason === "duplicate", applied: result.applied });
   }
   return json(res, 404, { ok: false, message: "接口不存在" });
 }
 
 async function serveStatic(req, res, url) {
-  const isAdminPage = ["/admin", "/admin/", "/admin.html"].includes(url.pathname);
-  const isLoginPage = ["/admin-login", "/admin-login.html"].includes(url.pathname);
+  if (url.pathname === "/admin.html") {
+    res.writeHead(301, { location: "/admin/", "cache-control": "no-store" }); res.end(); return;
+  }
+  if (["/admin-login", "/admin-login.html"].includes(url.pathname)) {
+    res.writeHead(301, { location: "/admin/login", "cache-control": "no-store" }); res.end(); return;
+  }
+  const isAdminPage = ["/admin", "/admin/", "/admin/index.html"].includes(url.pathname);
+  const isLoginPage = ["/admin/login", "/admin/login/"].includes(url.pathname);
+  const isAdminArea = isAdminPage || (url.pathname.startsWith("/admin/") && !isLoginPage);
   const session = getAdminSession(req);
-  if (isAdminPage && !session) {
-    res.writeHead(302, { location: "/admin-login.html", "cache-control": "no-store" });
+  if (isAdminArea && !session) {
+    res.writeHead(302, { location: "/admin/login", "cache-control": "no-store" });
     res.end();
     return;
   }
   if (isLoginPage && session) {
-    res.writeHead(302, { location: "/admin.html", "cache-control": "no-store" });
+    res.writeHead(302, { location: "/admin/", "cache-control": "no-store" });
     res.end();
     return;
   }
-  const requested = url.pathname === "/" ? "/index.html" : isAdminPage ? "/admin.html" : isLoginPage ? "/admin-login.html" : url.pathname;
+  const requested = url.pathname === "/" ? "/index.html" : isAdminPage ? "/admin/index.html" : isLoginPage ? "/admin-login.html" : url.pathname;
   const filePath = path.normalize(path.join(publicDir, requested));
   if (!filePath.startsWith(publicDir)) return json(res, 403, { ok: false });
   try {
@@ -508,9 +1000,11 @@ async function serveStatic(req, res, url) {
       "content-type": types[ext] || "application/octet-stream",
       "x-content-type-options": "nosniff",
       "referrer-policy": "same-origin",
-      "x-frame-options": isAdminPage || isLoginPage ? "DENY" : "SAMEORIGIN"
+      "x-frame-options": isAdminArea || isLoginPage ? "DENY" : "SAMEORIGIN",
+      "permissions-policy": "camera=(), microphone=(), geolocation=()",
+      ...(process.env.NODE_ENV === "production" ? { "strict-transport-security": "max-age=31536000; includeSubDomains" } : {})
     };
-    if (isAdminPage || isLoginPage) headers["cache-control"] = "no-store";
+    if (isAdminArea || isLoginPage) headers["cache-control"] = "no-store";
     res.writeHead(200, headers);
     res.end(body);
   } catch { json(res, 404, { ok: false, message: "页面不存在" }); }
@@ -527,4 +1021,35 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+let maintenanceRunning = false;
+async function scheduledMaintenance() {
+  if (maintenanceRunning) return;
+  maintenanceRunning = true;
+  const now = Date.now();
+  try {
+    try {
+      const fx = await readJson(fxFile, null);
+      const fxAge = now - Date.parse(fx?.updatedAt || 0);
+      if (!fx || !Number.isFinite(fxAge) || fxAge >= 8 * 60 * 60 * 1000) await refreshFxRate("scheduled");
+    } catch (error) {
+      console.error("Scheduled FX refresh failed:", error.message);
+    }
+    try {
+      const sync = await readJson(syncMetaFile, null);
+      const syncAge = now - Date.parse(sync?.completedAt || 0);
+      if (process.env.SUPPLIER_API_KEY && process.env.SUPPLIER_API_SECRET && (!sync || !Number.isFinite(syncAge) || syncAge >= 24 * 60 * 60 * 1000)) {
+        await syncSupplierCatalog("scheduled");
+      }
+    } catch (error) {
+      console.error("Scheduled product sync failed:", error.message);
+    }
+  } finally {
+    maintenanceRunning = false;
+  }
+}
+
 server.listen(port, () => console.log(`Panxiang Recharge listening on http://localhost:${port}`));
+setTimeout(scheduledMaintenance, 5000).unref();
+setInterval(scheduledMaintenance, 30 * 60 * 1000).unref();
+setTimeout(() => processPendingRecharges().catch((error) => console.error("Initial recharge recovery failed:", error.message)), 10000).unref();
+setInterval(() => processPendingRecharges().catch((error) => console.error("Recharge recovery failed:", error.message)), 60 * 1000).unref();
