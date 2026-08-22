@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>登录运营后台｜盼享随充</title>
+  <style>
+    :root{--bg:#f5f7fb;--card:#fff;--ink:#172033;--muted:#6b7280;--line:#e7ebf2;--brand:#e65f50;--brand-dark:#d94d40;--green:#159a69;--danger:#c73f35}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,"Microsoft YaHei",system-ui,sans-serif;color:var(--ink)}button,input{font:inherit}.login-shell{min-height:100vh;display:grid;grid-template-columns:minmax(380px,42%) 1fr}.brand-pane{position:relative;overflow:hidden;background:#172033;color:#fff;padding:56px clamp(36px,6vw,88px);display:flex;flex-direction:column;justify-content:space-between}.brand-pane:before,.brand-pane:after{content:"";position:absolute;border-radius:50%;filter:blur(2px)}.brand-pane:before{width:360px;height:360px;background:#e65f5018;right:-140px;top:-80px}.brand-pane:after{width:280px;height:280px;border:1px solid #ffffff12;left:-120px;bottom:-80px}.brand,.brand-copy,.brand-foot{position:relative;z-index:1}.brand{display:flex;align-items:center;gap:12px;font-size:21px;font-weight:750}.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#f58270,#d84d48);display:grid;place-items:center;box-shadow:0 10px 28px #e65f5040}.brand-copy{max-width:520px}.eyebrow{color:#f29284;font-size:12px;font-weight:750;letter-spacing:.18em}.brand-copy h1{font-size:clamp(35px,4vw,58px);line-height:1.12;margin:18px 0 20px;letter-spacing:-.035em}.brand-copy p{color:#b9c4d4;line-height:1.85;margin:0;font-size:15px}.points{display:grid;gap:13px;margin-top:42px;color:#d7deea;font-size:14px}.point{display:flex;align-items:center;gap:10px}.check{width:22px;height:22px;border-radius:7px;background:#ffffff12;color:#f29284;display:grid;place-items:center;font-size:12px}.brand-foot{color:#78879d;font-size:12px}.login-pane{display:grid;place-items:center;padding:40px}.login-wrap{width:min(440px,100%)}.login-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.login-top a{color:var(--muted);font-size:13px;text-decoration:none}.login-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:34px;box-shadow:0 18px 55px #17203312}.login-card h2{font-size:26px;margin:0 0 8px}.lead{font-size:14px;color:var(--muted);margin:0 0 24px;line-height:1.6}.error{display:none;margin:0 0 18px;padding:11px 12px;border-radius:9px;background:#fff1ef;color:var(--danger);font-size:13px;line-height:1.5;border:1px solid #ffd8d2}.error.show{display:block}.field{margin-bottom:16px}.field-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px}.field label{font-size:13px;font-weight:650}.hint{font-size:12px;color:#9aa4b2}.control{position:relative}.field input{width:100%;height:47px;border:1px solid var(--line);border-radius:10px;padding:0 13px;color:var(--ink);outline:none;background:#fff;transition:.18s}.field input:focus{border-color:#ed9185;box-shadow:0 0 0 3px #e65f5012}.field input::placeholder{color:#aab2bf}.password-input{padding-right:64px!important}.show-password{position:absolute;right:8px;top:7px;height:33px;border:0;background:transparent;color:#7a8595;font-size:12px;cursor:pointer}.caps{display:none;color:#b16a19;font-size:12px;margin-top:6px}.caps.show{display:block}.captcha-row{display:grid;grid-template-columns:1fr 150px;gap:10px}.captcha-box{height:47px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#f5f7fb;cursor:pointer;display:grid;place-items:center}.captcha-box img{width:100%;height:100%;object-fit:cover}.refresh{border:0;background:transparent;color:var(--brand);font-size:12px;padding:6px 0 0;cursor:pointer}.totp{font-variant-numeric:tabular-nums;letter-spacing:.32em;font-size:18px;font-weight:750}.login-btn{width:100%;height:48px;border:0;border-radius:10px;background:var(--brand);color:#fff;font-weight:750;cursor:pointer;margin-top:4px;box-shadow:0 9px 22px #e65f5035;transition:.18s}.login-btn:hover{background:var(--brand-dark);transform:translateY(-1px)}.login-btn:disabled{opacity:.65;cursor:not-allowed;transform:none}.security{display:flex;gap:10px;align-items:flex-start;margin-top:20px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.6}.shield{flex:0 0 28px;width:28px;height:28px;border-radius:9px;background:#eaf8f2;color:var(--green);display:grid;place-items:center}.footnote{text-align:center;color:#9aa4b2;font-size:12px;margin:18px 0 0}
+    @media(max-width:760px){.login-shell{display:block}.brand-pane{display:none}.login-pane{min-height:100vh;padding:20px}.login-card{padding:27px 22px;box-shadow:0 10px 34px #1720330d}.login-top{margin-bottom:14px}.captcha-row{grid-template-columns:1fr 132px}}
+  </style>
+</head>
+<body>
+  <main class="login-shell">
+    <section class="brand-pane" aria-label="盼享随充运营后台">
+      <div class="brand"><div class="logo">P</div>盼享随充</div>
+      <div class="brand-copy">
+        <div class="eyebrow">PANXIANG OPERATIONS</div>
+        <h1>让每一笔充值，<br>都清楚可控。</h1>
+        <p>集中管理商品、价格与上架状态，为印尼通信充值业务提供稳定的运营入口。</p>
+        <div class="points">
+          <div class="point"><span class="check">✓</span>商品与价格统一管理</div>
+          <div class="point"><span class="check">✓</span>供应商 SKU 快速同步</div>
+          <div class="point"><span class="check">✓</span>双重验证保护后台操作</div>
+        </div>
+      </div>
+      <div class="brand-foot">© 2026 盼享随充 · 仅限授权人员使用</div>
+    </section>
+    <section class="login-pane">
+      <div class="login-wrap">
+        <div class="login-top"><strong>运营管理中心</strong><a href="/">返回充值首页</a></div>
+        <form class="login-card" id="loginForm" novalidate>
+          <h2>登录运营后台</h2>
+          <p class="lead">使用管理员账号、图片验证码和 Google 动态验证码继续。</p>
+          <div class="error" id="error" role="alert"></div>
+          <div class="field">
+            <div class="field-head"><label for="username">管理员账号</label></div>
+            <input id="username" name="username" autocomplete="username" placeholder="请输入管理员账号" required autofocus>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="password">管理员密码</label></div>
+            <div class="control"><input class="password-input" id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入管理员密码" required><button class="show-password" id="showPassword" type="button">显示</button></div>
+            <div class="caps" id="caps">Caps Lock 已开启</div>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="captchaCode">图片验证码</label><button class="refresh" id="refreshCaptcha" type="button">看不清，换一张</button></div>
+            <div class="captcha-row"><input id="captchaCode" name="captchaCode" maxlength="5" autocomplete="off" placeholder="输入图中字符" required><button class="captcha-box" id="captchaBox" type="button" title="点击刷新验证码"><img id="captchaImage" alt="图片验证码"></button></div>
+          </div>
+          <div class="field">
+            <div class="field-head"><label for="totpCode">Google Authenticator</label><span class="hint">每 30 秒更新</span></div>
+            <input class="totp" id="totpCode" name="totpCode" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="000000" required>
+          </div>
+          <button class="login-btn" id="submitButton" type="submit">安全登录</button>
+          <div class="security"><span class="shield">◆</span><span>登录状态使用加密安全 Cookie 保存，并会在一段时间后自动失效。连续多次验证失败将临时锁定登录。</span></div>
+        </form>
+        <p class="footnote">动态验证码请从已绑定的 Google Authenticator 中获取</p>
+      </div>
+    </section>
+  </main>
+  <script>
+    const $=selector=>document.querySelector(selector);
+    let captchaId="";
+    function showError(message){const box=$("#error");box.textContent=message;box.classList.toggle("show",Boolean(message))}
+    async function refreshCaptcha(){
+      const image=$("#captchaImage");image.style.opacity=".45";
+      try{const response=await fetch("/api/admin/captcha",{credentials:"same-origin",cache:"no-store"});const data=await response.json();if(!response.ok)throw Error(data.message||"验证码加载失败");captchaId=data.captchaId;image.src=data.image}
+      catch(error){captchaId="";showError(error.message)}finally{image.style.opacity="1";$("#captchaCode").value=""}
+    }
+    $("#refreshCaptcha").onclick=()=>{showError("");refreshCaptcha()};$("#captchaBox").onclick=()=>{showError("");refreshCaptcha()};
+    $("#showPassword").onclick=()=>{const input=$("#password"),visible=input.type==="text";input.type=visible?"password":"text";$("#showPassword").textContent=visible?"显示":"隐藏";input.focus()};
+    $("#password").addEventListener("keyup",event=>$("#caps").classList.toggle("show",event.getModifierState&&event.getModifierState("CapsLock")));
+    $("#totpCode").addEventListener("input",event=>event.target.value=event.target.value.replace(/\D/g,"").slice(0,6));
+    $("#captchaCode").addEventListener("input",event=>event.target.value=event.target.value.toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,5));
+    $("#loginForm").onsubmit=async event=>{
+      event.preventDefault();showError("");
+      if(!event.currentTarget.reportValidity())return;
+      if(!captchaId){showError("请刷新图片验证码后重试");return}
+      const button=$("#submitButton");button.disabled=true;button.textContent="正在验证…";
+      try{
+        const response=await fetch("/api/admin/login",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:$("#username").value.trim(),password:$("#password").value,captchaId,captchaCode:$("#captchaCode").value.trim(),totpCode:$("#totpCode").value.trim()})});
+        const data=await response.json();if(!response.ok)throw Error(data.message||"登录失败");location.replace("/admin.html");
+      }catch(error){showError(error.message);$("#totpCode").value="";await refreshCaptcha();$("#totpCode").focus()}
+      finally{button.disabled=false;button.textContent="安全登录"}
+    };
+    refreshCaptcha();
+  </script>
+</body>
+</html>

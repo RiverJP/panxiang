@@ -1,0 +1,43 @@
+# Production secrets and local overrides
+.env
+.env.*
+!.env.example
+
+# Runtime state
+data/
+logs/
+*.log
+*.pid
+*.pid.lock
+
+# Dependencies and editor files
+node_modules/
+coverage/
+.nyc_output/
+.cache/
+dist/
+build/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Private keys and certificates
+keys/
+certs/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.jks
+*.keystore
+
+# Local deployment archives and backups
+*.zip
+*.tar
+*.tar.gz
+*.bak
+*.backup
+*~
