@@ -102,11 +102,25 @@
           </div>
           <div class="table-scroll">
             <table class="data-table published-order-table">
-              <thead><tr><th>序号</th><th class="drag-column">拖动</th><th>商品 / SKU</th><th>运营商与类型</th><th>前台售价</th><th>可售状态</th><th>展示标签</th><th>调整</th></tr></thead>
-              <tbody id="publishedOrderRows"><tr><td colspan="8" class="empty-state">正在加载上架商品…</td></tr></tbody>
+              <thead><tr><th>序号</th><th class="drag-column">拖动</th><th>商品 / SKU</th><th>运营商与类型</th><th>销售定价</th><th>可售状态</th><th>展示标签</th><th>排序</th><th>操作</th></tr></thead>
+              <tbody id="publishedOrderRows"><tr><td colspan="9" class="empty-state">正在加载上架商品…</td></tr></tbody>
             </table>
           </div>
-          <div class="panel-footer"><span>保存后刷新前台即可看到可售商品的新顺序</span><span>新上架套餐会自动追加；暂不可售商品修复后会沿用当前位置</span></div>
+          <div class="panel-footer"><span>售价保存后立即用于新订单；排序需单独点击“保存前台排序”</span><span>下架商品会移到下方历史区，原价格设置会保留</span></div>
+        </section>
+
+        <section class="admin-panel published-history-panel">
+          <div class="published-order-head">
+            <div><strong>历史上架</strong><span>曾经上架、当前已下架的商品保留在这里，方便调整价格后再次上架</span></div>
+            <span id="publishedHistoryCount">0 个历史商品</span>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table published-history-table">
+              <thead><tr><th>商品 / SKU</th><th>最近下架</th><th>运营商与类型</th><th>销售定价</th><th>当前状态</th><th>操作</th></tr></thead>
+              <tbody id="publishedHistoryRows"><tr><td colspan="6" class="empty-state">正在加载历史上架商品…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="panel-footer"><span>重新上架后会追加到当前商品队列末尾，可再拖动调整位置</span><span>供应商当前目录缺失的商品暂不能重新上架</span></div>
         </section>
       </section>
 

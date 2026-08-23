@@ -34,7 +34,12 @@ const statusMeta = {
   manual_review: ["人工处理中", "客服正在核查本订单", "progress"]
 };
 const terminalStatuses = new Set(["recharge_success", "refunded"]);
-const state = { products: [], services: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null, customerServiceUrl: "", publicConfigLoaded: false };
+const autoRefreshOrderStatuses = new Set(["payment_pending", "paid_pending_recharge", "recharge_processing"]);
+const slowRefreshOrderStatuses = new Set(["refund_required", "manual_review"]);
+const orderListRefreshDelay = 8_000;
+const slowOrderRefreshDelay = 45_000;
+const failedOrderRefreshDelay = 15_000;
+const state = { products: [], services: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, ordersLoading: false, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null, customerServiceUrl: "", publicConfigLoaded: false };
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -171,7 +176,7 @@ function renderProducts() {
   const filtered = state.products.filter((product) => (state.kind === "all" || product.category === state.kind) && (state.operator === "all" || normalizedOperator(product.operator) === state.operator));
   if (state.selected && !filtered.some((item) => item.id === state.selected.id)) state.selected = null;
   const shown = filtered.slice(0, state.visibleLimit);
-  els.products.innerHTML = shown.map((product) => `<button type="button" class="product${state.selected?.id === product.id ? " selected" : ""}" data-id="${escapeHtml(product.id)}" aria-pressed="${state.selected?.id === product.id}"><div class="op">${escapeHtml(product.operator)} · ${product.category === "data" ? "流量" : "话费"}</div><h3>${escapeHtml(product.label)}${product.popular ? '<span class="tag">热门</span>' : ""}</h3>${product.description ? `<p class="product-description">${escapeHtml(product.description)}</p>` : ""}<div class="price">${formatMoney(product.price)} <small>起</small></div></button>`).join("") || '<div class="empty-state">暂无匹配套餐，请调整筛选或联系客服</div>';
+  els.products.innerHTML = shown.map((product) => `<button type="button" class="product${state.selected?.id === product.id ? " selected" : ""}" data-id="${escapeHtml(product.id)}" aria-pressed="${state.selected?.id === product.id}"><div class="op">${escapeHtml(product.operator)} · ${product.category === "data" ? "流量" : "话费"}</div><h3>${escapeHtml(product.label)}${product.popular ? '<span class="tag">热门</span>' : ""}</h3>${product.description ? `<p class="product-description">${escapeHtml(product.description)}</p>` : ""}<div class="price">${formatMoney(product.price)}</div></button>`).join("") || '<div class="empty-state">暂无匹配套餐，请调整筛选或联系客服</div>';
   els.summary.textContent = filtered.length ? `${state.detectedOperator ? `已匹配 ${state.detectedOperator}，` : ""}共 ${filtered.length} 个套餐` : "当前筛选下暂无套餐";
   const remaining = Math.max(filtered.length - shown.length, 0);
   els.loadMore.hidden = remaining === 0;
@@ -308,31 +313,55 @@ async function payExistingOrder(orderId) {
 
 function metaFor(status) { return statusMeta[status] || ["状态更新中", "正在获取最新处理结果", "progress"]; }
 
-async function loadOrders() {
+function scheduleOrdersRefresh(results, requestFailed) {
+  if (state.route !== "orders") return;
+  const statuses = results.map(({ order }) => order?.status).filter(Boolean);
+  let delay = null;
+  if (statuses.some((status) => autoRefreshOrderStatuses.has(status))) delay = orderListRefreshDelay;
+  else if (requestFailed) delay = failedOrderRefreshDelay;
+  else if (statuses.some((status) => slowRefreshOrderStatuses.has(status))) delay = slowOrderRefreshDelay;
+  if (delay !== null) state.pollTimer = setTimeout(() => loadOrders(true), delay);
+}
+
+async function loadOrders(silent = false) {
+  if (state.ordersLoading) return;
+  state.ordersLoading = true;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = null;
   const refs = readOrderRefs();
-  els.ordersList.innerHTML = '<div class="empty-state">正在同步订单状态…</div>';
+  if (!silent) els.ordersList.innerHTML = '<div class="empty-state">正在同步订单状态…</div>';
   let accountOrders = [];
-  if (isWechat) {
-    try {
-      const data = await fetchJson("/api/me/orders?limit=50");
-      accountOrders = Array.isArray(data.orders) ? data.orders : [];
-      state.wechatAuthorized = true;
-      state.accountOrderIds = new Set(accountOrders.map((order) => order.id));
-    } catch { state.accountOrderIds = new Set(); }
+  let requestFailed = false;
+  try {
+    if (isWechat) {
+      try {
+        const data = await fetchJson("/api/me/orders?limit=50");
+        accountOrders = Array.isArray(data.orders) ? data.orders : [];
+        state.wechatAuthorized = true;
+        state.accountOrderIds = new Set(accountOrders.map((order) => order.id));
+      } catch { state.accountOrderIds = new Set(); requestFailed = true; }
+    }
+    const accountIds = new Set(accountOrders.map((order) => order.id));
+    const localResults = await Promise.all(refs.filter((ref) => !accountIds.has(ref.id)).map(async (ref) => {
+      try { return { ref, order: (await fetchJson(orderUrl(ref))).order }; } catch (error) { return { ref, error }; }
+    }));
+    if (localResults.some(({ error }) => error)) requestFailed = true;
+    const results = [...accountOrders.map((order) => ({ ref: { id: order.id }, order })), ...localResults]
+      .sort((left, right) => Date.parse(right.order?.createdAt || right.ref?.createdAt || 0) - Date.parse(left.order?.createdAt || left.ref?.createdAt || 0));
+    $("#my-order-count").textContent = String(results.length);
+    if (!results.length) {
+      els.ordersList.innerHTML = '<div class="empty-state">还没有充值订单<br>完成首笔下单后可在这里查看进度</div>';
+    } else {
+      els.ordersList.innerHTML = results.map(({ ref, order, error }) => {
+        if (error) return `<button type="button" class="order-row" data-order-id="${escapeHtml(ref.id)}"><div class="order-row-head"><small>${escapeHtml(ref.id)}</small><span class="status-chip danger">查询失败</span></div><h3>暂时无法获取订单</h3><p>${escapeHtml(error.message)}</p></button>`;
+        const meta = metaFor(order.status);
+        return `<button type="button" class="order-row" data-order-id="${escapeHtml(order.id)}"><div class="order-row-head"><small>${formatTime(order.createdAt)}</small><span class="status-chip ${meta[2]}">${meta[0]}</span></div><h3>${escapeHtml(order.productLabel)}</h3><div class="order-row-foot"><p>${escapeHtml(order.phone)}</p><strong>${formatMoney(order.price)}</strong></div></button>`;
+      }).join("");
+    }
+    scheduleOrdersRefresh(results, requestFailed);
+  } finally {
+    state.ordersLoading = false;
   }
-  const accountIds = new Set(accountOrders.map((order) => order.id));
-  const localResults = await Promise.all(refs.filter((ref) => !accountIds.has(ref.id)).map(async (ref) => {
-    try { return { ref, order: (await fetchJson(orderUrl(ref))).order }; } catch (error) { return { ref, error }; }
-  }));
-  const results = [...accountOrders.map((order) => ({ ref: { id: order.id }, order })), ...localResults]
-    .sort((left, right) => Date.parse(right.order?.createdAt || right.ref?.createdAt || 0) - Date.parse(left.order?.createdAt || left.ref?.createdAt || 0));
-  $("#my-order-count").textContent = String(results.length);
-  if (!results.length) { els.ordersList.innerHTML = '<div class="empty-state">还没有充值订单<br>完成首笔下单后可在这里查看进度</div>'; return; }
-  els.ordersList.innerHTML = results.map(({ ref, order, error }) => {
-    if (error) return `<button type="button" class="order-row" data-order-id="${escapeHtml(ref.id)}"><div class="order-row-head"><small>${escapeHtml(ref.id)}</small><span class="status-chip danger">查询失败</span></div><h3>暂时无法获取订单</h3><p>${escapeHtml(error.message)}</p></button>`;
-    const meta = metaFor(order.status);
-    return `<button type="button" class="order-row" data-order-id="${escapeHtml(order.id)}"><div class="order-row-head"><small>${formatTime(order.createdAt)}</small><span class="status-chip ${meta[2]}">${meta[0]}</span></div><h3>${escapeHtml(order.productLabel)}</h3><div class="order-row-foot"><p>${escapeHtml(order.phone)}</p><strong>${formatMoney(order.price)}</strong></div></button>`;
-  }).join("");
 }
 
 function timelineFor(order) {
@@ -344,7 +373,7 @@ function timelineFor(order) {
     [true, "订单已创建", formatTime(order.createdAt)],
     [paymentDone, paymentDone ? "微信支付已确认" : "等待支付确认", ""],
     [submitted, submitted ? "已提交运营商处理" : "等待提交充值", ""],
-    [finished, status === "refunded" ? "退款已完成" : finished ? "充值已完成" : "等待最终结果", formatTime(order.updatedAt)]
+    [finished, status === "refunded" ? "退款已完成" : finished ? "充值已完成" : "等待最终结果", formatTime(order.statusUpdatedAt || order.updatedAt)]
   ];
   return rows.map(([done, label, time]) => `<div class="timeline-item${done ? " done" : ""}">${escapeHtml(label)}${time ? `<br><small>${escapeHtml(time)}</small>` : ""}</div>`).join("");
 }
@@ -353,7 +382,8 @@ function renderOrderDetail(order) {
   const meta = metaFor(order.status);
   const symbol = order.status === "recharge_success" ? "✓" : order.status === "refunded" ? "↩" : "…";
   const payable = ["created", "pending_payment", "payment_pending"].includes(order.status);
-  els.orderDetail.innerHTML = `<article class="order-detail-card"><div class="order-status-hero"><div class="status-symbol">${symbol}</div><h1>${meta[0]}</h1><p>${escapeHtml(meta[1])}${terminalStatuses.has(order.status) ? "" : " · 页面将自动刷新"}</p></div><dl class="detail-list"><div><dt>充值套餐</dt><dd>${escapeHtml(order.productLabel)}</dd></div><div><dt>充值号码</dt><dd>${escapeHtml(order.phone)}</dd></div><div><dt>实付金额</dt><dd>${formatMoney(order.price)}</dd></div><div><dt>订单编号</dt><dd>${escapeHtml(order.id)}</dd></div><div><dt>创建时间</dt><dd>${formatTime(order.createdAt)}</dd></div></dl><div class="timeline"><h2>处理进度</h2>${timelineFor(order)}</div>${payable ? '<div class="payment-action"><button type="button" id="continue-payment">继续微信支付</button></div>' : ""}<div class="detail-actions"><button type="button" id="manual-refresh">刷新状态</button><button type="button" id="detail-support">联系客服</button></div></article>`;
+  const refreshesAutomatically = autoRefreshOrderStatuses.has(order.status) || slowRefreshOrderStatuses.has(order.status);
+  els.orderDetail.innerHTML = `<article class="order-detail-card"><div class="order-status-hero"><div class="status-symbol">${symbol}</div><h1>${meta[0]}</h1><p>${escapeHtml(meta[1])}${refreshesAutomatically ? " · 页面将自动刷新" : ""}</p></div><dl class="detail-list"><div><dt>充值套餐</dt><dd>${escapeHtml(order.productLabel)}</dd></div><div><dt>充值号码</dt><dd>${escapeHtml(order.phone)}</dd></div><div><dt>实付金额</dt><dd>${formatMoney(order.price)}</dd></div><div><dt>订单编号</dt><dd>${escapeHtml(order.id)}</dd></div><div><dt>创建时间</dt><dd>${formatTime(order.createdAt)}</dd></div></dl><div class="timeline"><h2>处理进度</h2>${timelineFor(order)}</div>${payable ? '<div class="payment-action"><button type="button" id="continue-payment">继续微信支付</button></div>' : ""}<div class="detail-actions"><button type="button" id="manual-refresh">刷新状态</button><button type="button" id="detail-support">联系客服</button></div></article>`;
   $("#continue-payment")?.addEventListener("click", () => payExistingOrder(order.id));
   $("#manual-refresh")?.addEventListener("click", () => loadOrderDetail(order.id, false));
   $("#detail-support")?.addEventListener("click", () => showSupport("订单问题"));
@@ -368,14 +398,17 @@ async function loadOrderDetail(id, resetPoll) {
   try {
     const order = (await fetchJson(orderUrl(ref))).order;
     renderOrderDetail(order);
-    if (!terminalStatuses.has(order.status) && state.route === "order") {
+    if (autoRefreshOrderStatuses.has(order.status) && state.route === "order") {
       state.pollCount += 1;
       const delay = Math.min(3000 + state.pollCount * 700, 12000);
       state.pollTimer = setTimeout(() => loadOrderDetail(id, false), delay);
+    } else if (slowRefreshOrderStatuses.has(order.status) && state.route === "order") {
+      state.pollTimer = setTimeout(() => loadOrderDetail(id, false), slowOrderRefreshDelay);
     }
   } catch (error) {
     els.orderDetail.innerHTML = `<div class="empty-state">${escapeHtml(error.message)}<br><button class="load-more" id="retry-detail" type="button">重新查询</button></div>`;
     $("#retry-detail")?.addEventListener("click", () => loadOrderDetail(id, true));
+    if (state.route === "order") state.pollTimer = setTimeout(() => loadOrderDetail(id, false), failedOrderRefreshDelay);
   }
 }
 

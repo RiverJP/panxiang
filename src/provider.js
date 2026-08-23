@@ -79,6 +79,8 @@ export async function supplierRequest(method, pathname, queryParams = {}, payloa
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
   if (!response.ok) {
     const error = new Error(`Supplier API ${response.status}`);
+    error.status = response.status;
+    error.code = String(data?.code || data?.error_code || "SUPPLIER_API_ERROR");
     error.details = data;
     throw error;
   }
@@ -87,6 +89,22 @@ export async function supplierRequest(method, pathname, queryParams = {}, payloa
 
 export async function listSupplierProducts() {
   return supplierRequest("GET", "/v1/products", { type: "topup" });
+}
+
+/**
+ * Keep every order operation on the same API version/path.  ReloadN accounts
+ * may be migrated from /v1/orders to /v2/orders, so create and query must not
+ * each carry their own hard-coded path.
+ */
+export function supplierOrderPath(env = process.env) {
+  const raw = String(env?.SUPPLIER_ORDER_PATH || "/v1/orders").trim();
+  if (!raw) throw new Error("SUPPLIER_ORDER_PATH 不能为空");
+  if (/^https?:\/\//i.test(raw) || raw.includes("?") || raw.includes("#")) {
+    throw new Error("SUPPLIER_ORDER_PATH 只能填写 API 路径，例如 /v2/orders");
+  }
+  const pathname = `/${raw.replace(/^\/+|\/+$/g, "")}`;
+  if (pathname === "/") throw new Error("SUPPLIER_ORDER_PATH 不能为空");
+  return pathname;
 }
 
 function supplierProductItems(response) {
@@ -332,34 +350,163 @@ export async function listAllSupplierProducts({ request = supplierRequest } = {}
   return { items: [...bySku.values()], pages, types, complete: pagination.every((entry) => entry.complete), pagination };
 }
 
-/** Create an idempotent ReloadN v1 order after payment has succeeded. */
-export async function createSupplierOrder({ order, product }) {
-  if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) {
+function supplierOrderIdentifier(order) {
+  return String(order?.order_id || order?.orderId || order?.id || "").trim();
+}
+
+function supplierClientOrderIdentifier(order) {
+  return String(order?.client_order_id || order?.clientOrderId || order?.merchant_order_id || order?.merchantOrderId || "").trim();
+}
+
+function looksLikeSupplierOrder(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Boolean(
+    supplierOrderIdentifier(value)
+    || supplierClientOrderIdentifier(value)
+    || Object.hasOwn(value, "status")
+    || Object.hasOwn(value, "order_status")
+  );
+}
+
+function supplierOrderCandidates(response) {
+  const direct = [
+    response?.data?.order,
+    response?.order,
+    response?.data?.data?.order,
+    response?.data?.data,
+    response?.data,
+    response
+  ].filter(looksLikeSupplierOrder);
+  const arrays = [
+    response?.data?.items,
+    response?.data?.orders,
+    response?.data?.data?.items,
+    response?.data?.data?.orders,
+    response?.items,
+    response?.orders,
+    Array.isArray(response?.data) ? response.data : null,
+    Array.isArray(response) ? response : null
+  ].filter(Array.isArray);
+  return [...direct, ...arrays.flat().filter(looksLikeSupplierOrder)];
+}
+
+/**
+ * Extract one order from either the single-order or list response shape.
+ * When an identifier is supplied this is intentionally strict: returning the
+ * first unrelated list item would update the wrong local order.
+ */
+export function extractSupplierOrder(response, { providerOrderId = "", clientOrderId = "" } = {}) {
+  const candidates = supplierOrderCandidates(response);
+  const wantedProviderId = String(providerOrderId || "").trim();
+  const wantedClientId = String(clientOrderId || "").trim();
+  if (wantedProviderId) {
+    const matched = candidates.find((order) => supplierOrderIdentifier(order) === wantedProviderId);
+    if (matched) return matched;
+  }
+  if (wantedClientId) {
+    const matched = candidates.find((order) => supplierClientOrderIdentifier(order) === wantedClientId);
+    if (matched) return matched;
+  }
+  return wantedProviderId || wantedClientId ? null : candidates[0] || null;
+}
+
+export class SupplierOrderNotFoundError extends Error {
+  constructor({ clientOrderId = "", providerOrderId = "", lookup = "query" } = {}) {
+    const identifiers = [
+      providerOrderId ? `providerOrderId=${providerOrderId}` : "",
+      clientOrderId ? `clientOrderId=${clientOrderId}` : ""
+    ].filter(Boolean).join(", ");
+    super(`供应商响应中未找到匹配订单${identifiers ? `（${identifiers}）` : ""}`);
+    this.name = "SupplierOrderNotFoundError";
+    this.code = "SUPPLIER_ORDER_NOT_FOUND";
+    this.status = 404;
+    this.details = { code: this.code, clientOrderId, providerOrderId, lookup };
+  }
+}
+
+function hasSupplierCredentials(request) {
+  return request !== supplierRequest || Boolean(process.env.SUPPLIER_API_KEY && process.env.SUPPLIER_API_SECRET);
+}
+
+function shouldFallBackToClientLookup(error) {
+  const status = Number(error?.status || String(error?.message || "").match(/Supplier API (\d+)/)?.[1]);
+  return [400, 404, 405].includes(status) || error instanceof SupplierOrderNotFoundError;
+}
+
+/** Create an idempotent ReloadN order after payment has succeeded. */
+export async function createSupplierOrder({ order, product }, options = {}) {
+  const request = options.request || supplierRequest;
+  const orderPath = options.orderPath || supplierOrderPath();
+  if (!hasSupplierCredentials(request)) {
     return { mode: "demo", status: "pending_provider", message: "供应商 API 尚未配置" };
   }
   const local = normalizePhone(order.phone);
   const dest = `0062${local.startsWith("0") ? local.slice(1) : local}`;
-  const data = await supplierRequest("POST", process.env.SUPPLIER_ORDER_PATH || "/v1/orders", {}, {
+  const data = await request("POST", orderPath, {}, {
     client_order_id: order.id,
     sku: product.sku || product.id,
     dest
   });
-  return { mode: "live", status: data?.data?.order?.status || "processing", data };
+  const providerOrder = extractSupplierOrder(data, { clientOrderId: order.id });
+  if (!providerOrder) throw new SupplierOrderNotFoundError({ clientOrderId: order.id, lookup: "create" });
+  return { mode: "live", status: providerOrder.status || providerOrder.order_status || "processing", order: providerOrder, data };
 }
 
-/** Query the current ReloadN order state without creating a second order. */
-export async function querySupplierOrder(clientOrderId) {
-  if (!process.env.SUPPLIER_API_KEY || !process.env.SUPPLIER_API_SECRET) {
-    return { mode: "demo", status: "processing", message: "供应商 API 尚未配置" };
+/**
+ * Query the current ReloadN order state without creating a second order.
+ * Prefer the immutable provider order id.  Older API deployments that do not
+ * expose the detail endpoint fall back to the idempotent client_order_id list
+ * query on the exact same configured order path.
+ */
+export async function querySupplierOrder(clientOrderId, providerOrderId = "", options = {}) {
+  if (providerOrderId && typeof providerOrderId === "object") {
+    options = providerOrderId;
+    providerOrderId = options.providerOrderId || "";
   }
-  const data = await supplierRequest("GET", "/v1/orders", { client_order_id: clientOrderId });
-  const order = data?.data?.order
-    || data?.data?.items?.[0]
-    || data?.data?.orders?.[0]
-    || data?.order
-    || data?.items?.[0]
-    || null;
-  return { mode: "live", status: order?.status || "processing", data };
+  const request = options.request || supplierRequest;
+  const orderPath = options.orderPath || supplierOrderPath();
+  if (!hasSupplierCredentials(request)) {
+    return { mode: "demo", status: "pending_provider", message: "供应商 API 尚未配置" };
+  }
+  const wantedClientId = String(clientOrderId || "").trim();
+  const wantedProviderId = String(providerOrderId || "").trim();
+  if (!wantedClientId && !wantedProviderId) throw new Error("查询供应商订单至少需要一个订单号");
+
+  if (wantedProviderId) {
+    try {
+      const data = await request("GET", `${orderPath}/${rfc3986(wantedProviderId)}`, {});
+      const order = extractSupplierOrder(data, { providerOrderId: wantedProviderId });
+      if (order) {
+        return {
+          mode: "live",
+          status: order.status || order.order_status || "processing",
+          order,
+          data,
+          lookup: "provider_order_id"
+        };
+      }
+      if (!wantedClientId) throw new SupplierOrderNotFoundError({ providerOrderId: wantedProviderId, lookup: "provider_order_id" });
+    } catch (error) {
+      if (!wantedClientId || !shouldFallBackToClientLookup(error)) throw error;
+    }
+  }
+
+  const data = await request("GET", orderPath, { client_order_id: wantedClientId });
+  const order = extractSupplierOrder(data, { clientOrderId: wantedClientId, providerOrderId: wantedProviderId });
+  if (!order) {
+    throw new SupplierOrderNotFoundError({
+      clientOrderId: wantedClientId,
+      providerOrderId: wantedProviderId,
+      lookup: "client_order_id"
+    });
+  }
+  return {
+    mode: "live",
+    status: order.status || order.order_status || "processing",
+    order,
+    data,
+    lookup: "client_order_id"
+  };
 }
 
 export function verifyWebhookSignature(rawBody, headers) {

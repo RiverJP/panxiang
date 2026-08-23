@@ -533,7 +533,15 @@ export class OrderStore {
 
     return this.transaction(() => {
       const duplicate = this.getWebhook(webhookId);
-      if (duplicate) return { applied: false, reason: "duplicate", webhook: duplicate, order: duplicate.outTradeNo ? this.getOrder(duplicate.outTradeNo) : null };
+      if (duplicate && duplicate.outcome !== "unmatched") {
+        return { applied: false, reason: "duplicate", webhook: duplicate, order: duplicate.outTradeNo ? this.getOrder(duplicate.outTradeNo) : null };
+      }
+      // Older builds persisted unmatched callbacks. Remove that tombstone so
+      // the supplier can replay the same webhook id after the local order has
+      // become visible. New unmatched callbacks throw below and roll back.
+      if (duplicate?.outcome === "unmatched") {
+        this.db.prepare("DELETE FROM provider_webhooks WHERE webhook_id = ?").run(webhookId);
+      }
 
       const orderByTradeNo = suppliedOutTradeNo ? this.getOrder(suppliedOutTradeNo) : null;
       const orderByProviderId = providerOrderId ? this.getOrderByProviderOrderId(providerOrderId) : null;
@@ -558,7 +566,10 @@ export class OrderStore {
         } else {
           const requestedStatus = input.status ? requiredText(input.status, "Webhook订单状态", 64) : null;
           const protectedStatus = order.status === "refunded"
-            || (order.status === "recharge_success" && requestedStatus && !["recharge_success", "refunded"].includes(requestedStatus))
+            || (order.status === "recharge_success"
+              && eventType !== "order.refunded"
+              && requestedStatus
+              && !["recharge_success", "refunded"].includes(requestedStatus))
             || (order.status === "refund_required" && requestedStatus === "recharge_processing")
             ? order.status
             : requestedStatus;
@@ -576,6 +587,11 @@ export class OrderStore {
           outcome = "applied";
           processedAt = nowIso();
         }
+      } else {
+        const error = new Error("供应商回调暂未匹配到本地订单，请稍后重试");
+        error.code = "WEBHOOK_ORDER_NOT_FOUND";
+        error.status = 503;
+        throw error;
       }
 
       this.db.prepare(`

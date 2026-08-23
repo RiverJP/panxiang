@@ -17,7 +17,6 @@ import {
   supplierProductAvailability,
   normalizeStoredSupplierAvailability,
   normalizeAutoPricingRule,
-  normalizeProviderFxTimestamp,
   effectiveFxRateTimestamp,
   autoPriceState,
   shouldRefreshFxRate
@@ -34,6 +33,14 @@ import {
 } from "./src/catalog-display.js";
 import { defaultCustomerServiceUrl, normalizeCustomerServiceUrl } from "./src/public-config.js";
 import { MAX_LIFE_SERVICES, compareLifeServices, normalizeLifeService, normalizeLifeServices, publicLifeServices, validateLifeServicesStrict } from "./src/life-services.js";
+import {
+  isActiveRechargeStatus,
+  nextProcessingPollAt,
+  shouldActivelyRefreshOrder,
+  supplierStatusToLocal
+} from "./src/order-status.js";
+import { fetchFxQuote, selectFxProvider } from "./src/fx-provider.js";
+import { applyPublicationTransition, migratePublicationHistory } from "./src/catalog-publication.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(root, ".env");
@@ -120,9 +127,35 @@ async function writeJson(file, value) {
 
 function fxStateForAdmin(fx) {
   const state = fx && typeof fx === "object" && !Array.isArray(fx) ? fx : {};
+  let configuredProvider = null;
+  let providerConfigurationError = null;
+  try {
+    configuredProvider = selectFxProvider(process.env);
+  } catch (error) {
+    providerConfigurationError = String(error?.message || "汇率服务配置无效");
+  }
+  const storedSource = String(state.source || "").trim();
+  const safeStoredSource = /^https?:\/\//i.test(storedSource)
+    ? (state.provider === "open-er-api"
+      ? "open.er-api /v6/latest/CNY (daily fallback)"
+      : state.provider === "exchange-rate-api"
+        ? "ExchangeRate-API /v6/latest/CNY"
+        : "legacy FX provider")
+    : storedSource;
   const normalizedPricing = normalizeAutoPricingRule(state.autoPricing);
   const effectiveState = {
     ...state,
+    source: safeStoredSource || null,
+    provider: state.provider || configuredProvider?.provider || null,
+    configuredProvider: configuredProvider?.provider || null,
+    providerSource: configuredProvider?.source || null,
+    recommendedRefreshMinutes: Number(state.recommendedRefreshMinutes)
+      || configuredProvider?.recommendedRefreshMinutes
+      || null,
+    degraded: typeof state.degraded === "boolean"
+      ? state.degraded
+      : Boolean(configuredProvider?.degraded),
+    providerConfigurationError,
     autoPricing: normalizedPricing || state.autoPricing || { ...DEFAULT_AUTO_PRICING_RULE }
   };
   const pricing = autoPriceState({ buyPriceIdr: 10_000 }, effectiveState);
@@ -136,15 +169,18 @@ function fxStateForAdmin(fx) {
   };
 }
 
-function providerRateTimestamp(data) {
-  const unixSeconds = Number(data?.time_last_update_unix);
-  const date = String(data?.date || "").trim();
-  const candidate = Number.isFinite(unixSeconds) && unixSeconds > 0
-    ? unixSeconds * 1000
-    : (/^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date}T00:00:00.000Z` : null);
-  return normalizeProviderFxTimestamp(candidate, {
-    maxFutureSkewSeconds: Number(process.env.FX_MAX_FUTURE_SKEW_SECONDS || 300)
-  });
+function fxRefreshIntervalMinutes(fx) {
+  try {
+    const selected = selectFxProvider(process.env);
+    const persisted = Number(fx?.recommendedRefreshMinutes);
+    if (fx?.provider === selected.provider && Number.isFinite(persisted) && persisted >= 5 && persisted <= 24 * 60) {
+      return persisted;
+    }
+    return selected.recommendedRefreshMinutes;
+  } catch {
+    const persisted = Number(fx?.recommendedRefreshMinutes);
+    return Number.isFinite(persisted) && persisted >= 5 && persisted <= 24 * 60 ? persisted : 8 * 60;
+  }
 }
 
 async function appendAudit(action, details = {}) {
@@ -236,6 +272,23 @@ async function migrateStoredProductAvailability() {
   const confirmedMissingCount = migrated.filter((product) => product.active === false).length;
   await writeJson(productsFile, migrated);
   await appendAudit("products.availability_migrated", { restoredCount, confirmedMissingCount });
+}
+
+async function migrateStoredPublicationHistory() {
+  const products = await readJson(productsFile, null);
+  if (!Array.isArray(products)) return;
+  const migratedAt = new Date().toISOString();
+  const migrated = products.map((product) => migratePublicationHistory(product, migratedAt));
+  if (JSON.stringify(migrated) === JSON.stringify(products)) return;
+  const inferredHistoricalCount = migrated.filter((product, index) => (
+    product.everPublished === true && products[index]?.everPublished !== true
+  )).length;
+  await writeJson(productsFile, migrated);
+  await appendAudit("products.publication_history_migrated", {
+    count: migrated.length,
+    inferredHistoricalCount,
+    migratedAt
+  });
 }
 
 function parseCookies(req) {
@@ -626,28 +679,22 @@ function appendNewlyPublishedProducts(products, skus, fx) {
 
 async function refreshFxRate(source = "manual") {
   const refreshStartedAt = Date.now();
-  const fxUrl = process.env.FX_RATE_URL || "https://open.er-api.com/v6/latest/CNY";
   // The network request deliberately stays outside the mutation lock. Only
   // reading the current record, applying safety checks and writing the new
   // record need serialization; a slow rate provider must not block a manual
   // rate or pricing-rule update.
-  const response = await fetch(fxUrl, {
-    signal: AbortSignal.timeout(10000),
-    headers: { accept: "application/json", "cache-control": "no-cache" }
+  const quote = await fetchFxQuote({
+    env: process.env,
+    fetchImpl: fetch,
+    now: refreshStartedAt,
+    signal: AbortSignal.timeout(10000)
   });
-  if (!response.ok) throw new Error(`汇率服务返回 ${response.status}`);
-  const data = await response.json();
-  if (data?.result && data.result !== "success") throw new Error("汇率服务返回失败状态");
-  if (data?.base_code && String(data.base_code).toUpperCase() !== "CNY") throw new Error("汇率服务基准币种不是 CNY");
-  const idrPerCny = Number(data?.rates?.IDR);
+  const idrPerCny = Number(quote.idrPerCny);
   const minRate = Number(process.env.FX_IDR_CNY_MIN || 1000);
   const maxRate = Number(process.env.FX_IDR_CNY_MAX || 5000);
   if (!Number.isFinite(idrPerCny) || idrPerCny < minRate || idrPerCny > maxRate) throw new Error("汇率响应超出安全范围，未更新自动售价");
-  const providerUpdatedAt = providerRateTimestamp(data);
-  if (!providerUpdatedAt) throw new Error("汇率服务未返回有效的行情时间，未更新自动售价");
-  const providerNextUpdateAt = Number.isFinite(Number(data?.time_next_update_unix)) && Number(data.time_next_update_unix) > 0
-    ? new Date(Number(data.time_next_update_unix) * 1000).toISOString()
-    : null;
+  const providerUpdatedAt = quote.providerUpdatedAt;
+  const providerNextUpdateAt = quote.providerNextUpdateAt;
 
   return withFxMutationLock(async () => {
     const previous = await readJsonStrict(fxFile, null);
@@ -665,14 +712,17 @@ async function refreshFxRate(source = "manual") {
     if (previous?.updateMode === "automatic" && Number.isFinite(previousQuoteTime) && incomingQuoteTime < previousQuoteTime) {
       throw new Error("汇率服务返回的行情时间早于当前记录，已拒绝覆盖");
     }
-    const fetchedAt = new Date().toISOString();
+    const fetchedAt = quote.fetchedAt || new Date().toISOString();
     const autoPricing = previous && Object.hasOwn(previous, "autoPricing")
       ? previous.autoPricing
       : { ...DEFAULT_AUTO_PRICING_RULE };
     const fx = {
       ...(previous || {}),
       idrPerCny,
-      source: fxUrl,
+      provider: quote.provider,
+      source: quote.source,
+      recommendedRefreshMinutes: quote.recommendedRefreshMinutes,
+      degraded: Boolean(quote.degraded),
       updateMode: "automatic",
       trigger: source,
       rateChanged: !Number.isFinite(previousRate) || previousRate !== idrPerCny,
@@ -711,7 +761,7 @@ async function syncSupplierCatalog(source = "manual") {
     const canRetireMissing = Boolean(response.complete && sameQueryScope);
     const seen = new Set(normalized.map((product) => product.sku));
     const products = normalized.map((fresh) => {
-      const previous = oldBySku.get(fresh.sku) || {};
+      const previous = migratePublicationHistory(oldBySku.get(fresh.sku) || {}, now);
       const category = previous.categoryManual ? previous.category : fresh.category;
       const operator = previous.operatorManual ? previous.operator : fresh.operator;
       const manualCatalogApproved = Boolean(previous.manualCatalogApproved);
@@ -719,7 +769,7 @@ async function syncSupplierCatalog(source = "manual") {
         && Boolean(operator)
         && operator !== "未知运营商"
         && (fresh.sourceEligible || manualCatalogApproved);
-      return {
+      const next = {
         ...fresh,
         supplierName: fresh.name,
         sourceQueryTypes: response.types,
@@ -736,18 +786,30 @@ async function syncSupplierCatalog(source = "manual") {
         description: Object.hasOwn(previous, "description") ? previous.description : fresh.name,
         priceMode: previous.priceMode === "manual" ? "manual" : "auto",
         ...(previous.priceCny !== undefined ? { priceCny: previous.priceCny } : {}),
-        published: Boolean(previous.published && fresh.active && catalogEligible),
+        published: Boolean(previous.published),
+        everPublished: Boolean(previous.everPublished),
+        firstPublishedAt: previous.firstPublishedAt,
+        lastPublishedAt: previous.lastPublishedAt,
+        lastUnpublishedAt: previous.lastUnpublishedAt,
         popular: Boolean(previous.popular),
         sortOrder: Number.isFinite(Number(previous.sortOrder)) ? Number(previous.sortOrder) : 0,
         firstSeenAt: previous.firstSeenAt || now,
         lastSeenAt: now,
         syncedAt: now
       };
+      return applyPublicationTransition(next, Boolean(previous.published && fresh.active && catalogEligible), now);
     });
-    for (const previous of old) {
+    for (const storedPrevious of old) {
+      const previous = migratePublicationHistory(storedPrevious, now);
       if (seen.has(previous.sku)) continue;
       products.push(canRetireMissing
-        ? { ...previous, active: false, statusKnown: false, published: false, unavailableReason: MISSING_FROM_COMPLETE_CATALOG_REASON, syncedAt: now }
+        ? applyPublicationTransition({
+          ...previous,
+          active: false,
+          statusKnown: false,
+          unavailableReason: MISSING_FROM_COMPLETE_CATALOG_REASON,
+          syncedAt: now
+        }, false, now)
         : { ...previous });
     }
     products.sort((left, right) => String(left.operator || "").localeCompare(String(right.operator || "")) || String(left.category || "").localeCompare(String(right.category || "")) || String(left.sku || "").localeCompare(String(right.sku || "")));
@@ -773,23 +835,6 @@ async function syncSupplierCatalog(source = "manual") {
   });
 }
 
-function supplierOrderFromResponse(provider) {
-  return provider?.data?.data?.order
-    || provider?.data?.data?.items?.[0]
-    || provider?.data?.data?.orders?.[0]
-    || provider?.data?.order
-    || provider?.data?.items?.[0]
-    || null;
-}
-
-function supplierStatusToLocal(status) {
-  const normalized = String(status || "").toLowerCase();
-  if (["success", "successful", "completed", "complete"].includes(normalized)) return "recharge_success";
-  if (["failed", "failure", "cancelled", "canceled", "rejected"].includes(normalized)) return "refund_required";
-  if (["refunded", "refund"].includes(normalized)) return "refund_required";
-  return "recharge_processing";
-}
-
 function safeErrorDetails(error) {
   const details = error?.details && typeof error.details === "object" ? error.details : {};
   return {
@@ -800,7 +845,8 @@ function safeErrorDetails(error) {
 }
 
 function retryableSupplierError(error) {
-  const status = Number(String(error?.message || "").match(/Supplier API (\d+)/)?.[1]);
+  if (error?.code === "SUPPLIER_ORDER_NOT_FOUND") return true;
+  const status = Number(error?.status || String(error?.message || "").match(/Supplier API (\d+)/)?.[1]);
   return !Number.isFinite(status) || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
 }
 
@@ -821,19 +867,42 @@ async function processRecharge(orderId, { force = false } = {}) {
 
     const shouldQuery = order.status === "recharge_processing" || Boolean(order.providerOrderId);
     const provider = shouldQuery
-      ? await querySupplierOrder(order.id)
+      ? await querySupplierOrder(order.id, order.providerOrderId)
       : await createSupplierOrder({ order, product: { id: order.productId, sku: order.productId } });
-    const providerOrder = supplierOrderFromResponse(provider);
+    const providerOrder = provider?.order || null;
     const localStatus = supplierStatusToLocal(providerOrder?.status || provider.status);
+    const checkedAt = new Date().toISOString();
+    const latestOrder = orderStore.getOrder(orderId);
+    if (!latestOrder || !["paid_pending_recharge", "recharge_processing", "manual_review"].includes(latestOrder.status)) {
+      return { skipped: "status_changed", order: latestOrder };
+    }
+    const incomingVersion = Number(providerOrder?.order_version);
+    const currentVersion = Number(latestOrder.orderVersion || 0);
+    if (Number.isSafeInteger(incomingVersion) && incomingVersion >= 0 && incomingVersion < currentVersion) {
+      orderStore.updateOrder(orderId, { providerCheckedAt: checkedAt, updatedAt: checkedAt }, {
+        expectedStatuses: ["paid_pending_recharge", "recharge_processing", "manual_review"]
+      });
+      return { skipped: "stale_provider_version", order: orderStore.getOrder(orderId) };
+    }
+    const previousPollCount = Number(latestOrder.providerPollCount || 0);
+    const providerPollCount = localStatus === "recharge_processing" ? previousPollCount + 1 : 0;
     const patch = {
       status: localStatus,
       provider,
-      providerOrderId: providerOrder?.order_id || providerOrder?.id || order.providerOrderId,
-      retryCount: localStatus === "recharge_processing" ? Number(order.retryCount || 0) : 0,
-      nextRetryAt: localStatus === "recharge_processing" ? new Date(Date.now() + 10 * 60 * 1000).toISOString() : null,
+      providerOrderId: providerOrder?.order_id || providerOrder?.id || latestOrder.providerOrderId,
+      providerCheckedAt: checkedAt,
+      providerPollCount,
+      orderVersion: Number.isSafeInteger(incomingVersion) && incomingVersion >= 0
+        ? Math.max(currentVersion, incomingVersion)
+        : currentVersion,
+      retryCount: localStatus === "recharge_processing" ? Number(latestOrder.retryCount || 0) : 0,
+      nextRetryAt: localStatus === "recharge_processing"
+        ? nextProcessingPollAt(previousPollCount, { maxMs: 5 * 60 * 1000 })
+        : null,
       lastProviderError: null,
       needsManualAction: localStatus === "refund_required",
-      updatedAt: new Date().toISOString()
+      statusUpdatedAt: localStatus === latestOrder.status ? latestOrder.statusUpdatedAt : checkedAt,
+      updatedAt: checkedAt
     };
     return orderStore.updateOrder(order.id, patch, {
       expectedStatuses: ["paid_pending_recharge", "recharge_processing", "manual_review"]
@@ -846,18 +915,33 @@ async function processRecharge(orderId, { force = false } = {}) {
     }
     const retryCount = Number(order.retryCount || 0) + 1;
     const retryable = retryableSupplierError(error) && retryCount <= 8;
+    const checkedAt = new Date().toISOString();
+    const nextStatus = retryable ? order.status : "manual_review";
     orderStore.updateOrder(order.id, {
-      status: retryable ? "paid_pending_recharge" : "manual_review",
+      status: nextStatus,
       retryCount,
       nextRetryAt: retryable ? nextRetryAt(retryCount) : null,
+      providerCheckedAt: checkedAt,
       lastProviderError: safeErrorDetails(error),
       needsManualAction: !retryable,
-      updatedAt: new Date().toISOString()
+      statusUpdatedAt: nextStatus === order.status ? order.statusUpdatedAt : checkedAt,
+      updatedAt: checkedAt
     }, { expectedStatuses: ["paid_pending_recharge", "recharge_processing", "manual_review"] });
     return { error: safeErrorDetails(error), retryable };
   } finally {
     rechargeLocks.delete(orderId);
   }
+}
+
+async function refreshActiveOrders(orders, { minIntervalMs = 10_000, limit = 20 } = {}) {
+  const candidates = (Array.isArray(orders) ? orders : [])
+    .filter((order) => shouldActivelyRefreshOrder(order, { minIntervalMs }))
+    .slice(0, limit);
+  for (let index = 0; index < candidates.length; index += 5) {
+    const batch = candidates.slice(index, index + 5);
+    await Promise.allSettled(batch.map((order) => processRecharge(order.id)));
+  }
+  return candidates.length;
 }
 
 async function processPendingRecharges() {
@@ -1054,15 +1138,16 @@ async function adminApi(req, res, url) {
       const newlyPublishedSkus = input.published
         ? eligibleProducts.filter((product) => !product.published).map((product) => String(product.sku))
         : [];
+      let changed = 0;
+      const transitionedAt = new Date().toISOString();
+      for (const product of eligibleProducts) {
+        if (Boolean(product.published) !== input.published) changed += 1;
+        Object.assign(product, applyPublicationTransition(product, input.published, transitionedAt));
+      }
       try {
         appendNewlyPublishedProducts(products, newlyPublishedSkus, fx);
       } catch (error) {
         return json(res, 409, { ok: false, message: error.message || "上架商品数量超过排序上限" });
-      }
-      let changed = 0;
-      for (const product of eligibleProducts) {
-        if (Boolean(product.published) !== input.published) changed += 1;
-        product.published = input.published;
       }
       await writeJson(productsFile, products);
       await appendAudit(input.published ? "products.bulk_publish" : "products.bulk_unpublish", { skus, changed });
@@ -1137,6 +1222,7 @@ async function adminApi(req, res, url) {
       if (requestedPublished && product.active !== true) return json(res, 400, { ok: false, message: "该 SKU 已从最近确认的完整目录中缺失，请重新同步确认后再上架" });
       if (requestedPublished && !productCanAppearInCatalog(product)) return json(res, 400, { ok: false, message: "请先确认商品是印尼通信套餐，并完成分类和运营商设置" });
       if (requestedPublished && getSellPriceCny(product, fx) === null) return json(res, 400, { ok: false, message: "商品没有有效售价，不能上架" });
+      Object.assign(product, applyPublicationTransition(product, requestedPublished, new Date().toISOString()));
       if (requestedPublished && !wasPublished) {
         try {
           appendNewlyPublishedProducts(products, [String(product.sku)], fx);
@@ -1144,7 +1230,6 @@ async function adminApi(req, res, url) {
           return json(res, 409, { ok: false, message: error.message || "上架商品数量超过排序上限" });
         }
       }
-      product.published = requestedPublished;
       await writeJson(productsFile, products);
       await appendAudit("product.update", { sku, published: product.published, priceMode: product.priceMode, popular: product.popular, sortOrder: product.sortOrder });
       return json(res, 200, { ok: true, product: adminProductView(product, fx), publishedOrder: publishedCatalogOrderState(products, fx) });
@@ -1229,7 +1314,10 @@ async function adminApi(req, res, url) {
     return json(res, 200, { ok: true, fx: fxStateForAdmin(saved.fx) });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/orders") {
-    return json(res, 200, { ok: true, orders: orderStore.listOrders({ limit: 2000 }) });
+    let orders = orderStore.listOrders({ limit: 2000 });
+    await refreshActiveOrders(orders, { minIntervalMs: 10_000, limit: 50 });
+    orders = orderStore.listOrders({ limit: 2000 });
+    return json(res, 200, { ok: true, orders });
   }
   if (req.method === "POST" && /^\/api\/admin\/orders\/[^/]+\/retry$/.test(url.pathname)) {
     const orderId = decodeURIComponent(url.pathname.split("/").at(-2));
@@ -1246,6 +1334,7 @@ async function adminApi(req, res, url) {
     const products = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
     const sync = await readJson(syncMetaFile, null);
+    const fxRefreshMinutes = fxRefreshIntervalMinutes(fx);
     return json(res, 200, {
       ok: true,
       status: {
@@ -1255,7 +1344,11 @@ async function adminApi(req, res, url) {
         orders: orderStore.listOrders({ limit: 2000 }).length,
         fx: fxStateForAdmin(fx),
         sync,
-        schedules: { productSyncHours: 24, fxRefreshHours: 8 }
+        schedules: {
+          productSyncHours: 24,
+          fxRefreshMinutes,
+          fxRefreshHours: Number((fxRefreshMinutes / 60).toFixed(2))
+        }
       }
     });
   }
@@ -1334,7 +1427,10 @@ async function handleApi(req, res, url) {
     const requestedOffset = Number(url.searchParams.get("offset"));
     const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(100, requestedLimit) : 50;
     const offset = Number.isSafeInteger(requestedOffset) && requestedOffset >= 0 ? Math.min(1_000_000_000, requestedOffset) : 0;
-    const orders = orderStore.listOrders({ userId: identity.user.id, limit, offset }).map(publicOrder);
+    let ownedOrders = orderStore.listOrders({ userId: identity.user.id, limit, offset });
+    await refreshActiveOrders(ownedOrders, { minIntervalMs: 8_000, limit: 20 });
+    ownedOrders = orderStore.listOrders({ userId: identity.user.id, limit, offset });
+    const orders = ownedOrders.map(publicOrder);
     return json(res, 200, { ok: true, orders, limit, offset, nextOffset: orders.length === limit ? offset + limit : null });
   }
   if (req.method === "GET" && url.pathname.startsWith("/api/orders/")) {
@@ -1351,7 +1447,10 @@ async function handleApi(req, res, url) {
       if (linked.updated) order = linked.order;
     }
     const ownsOrder = orderOwnedByIdentity(order, identity) || (!order.userId && legacyTokenMatches);
-    return ownsOrder ? json(res, 200, { ok: true, order: publicOrder(order) }) : json(res, 403, { ok: false, message: "无权查看该订单" });
+    if (!ownsOrder) return json(res, 403, { ok: false, message: "无权查看该订单" });
+    await refreshActiveOrders([order], { minIntervalMs: 5_000, limit: 1 });
+    order = orderStore.getOrder(orderId) || order;
+    return json(res, 200, { ok: true, order: publicOrder(order) });
   }
   if (req.method === "POST" && url.pathname === "/api/orders") {
     const identity = requireWechatIdentity(req, res);
@@ -1371,7 +1470,8 @@ async function handleApi(req, res, url) {
     if (detectedOperator && detectedOperator !== product.operator) return json(res, 400, { ok: false, message: `该手机号段识别为 ${detectedOperator}，请选择对应套餐` });
     const id = `PX${Date.now()}${crypto.randomBytes(3).toString("hex")}`;
     const lookupToken = crypto.randomBytes(24).toString("base64url");
-    const order = { id, lookupToken, userId: identity.user.id, payerOpenid: identity.user.openid, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt: new Date().toISOString() };
+    const createdAt = new Date().toISOString();
+    const order = { id, lookupToken, userId: identity.user.id, payerOpenid: identity.user.openid, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt, statusUpdatedAt: createdAt };
     // 供应商下单必须在微信支付成功后执行，避免用户未付款却触发真实充值。
     order.status = "pending_payment";
     const created = orderStore.createOrder(order);
@@ -1457,15 +1557,17 @@ async function handleApi(req, res, url) {
     const transactionId = String(payment.transaction_id || "");
     if (!transactionId) return json(res, 400, { code: "FAIL", message: "微信支付流水号缺失" });
     const payer = owner || orderStore.upsertWechatUser({ appid: payment.appid, openid: payerOpenid });
+    const paidAt = payment.success_time || new Date().toISOString();
     const update = orderStore.updateOrder(order.id, {
       status: "paid_pending_recharge",
       transactionId,
       userId: payer.id,
       payerOpenid: payerOpenid || order.payerOpenid,
-      paidAt: payment.success_time || new Date().toISOString(),
+      paidAt,
       paymentSummary: { transactionId, amountFen: Number(payment.amount?.total), tradeState: payment.trade_state },
       retryCount: Number(order.retryCount || 0),
       nextRetryAt: new Date().toISOString(),
+      statusUpdatedAt: paidAt,
       updatedAt: new Date().toISOString()
     }, { expectedStatuses: ["pending_payment", "payment_pending"] });
     if (!update.updated) {
@@ -1495,16 +1597,31 @@ async function handleApi(req, res, url) {
       // been refunded, so keep the order in the manual-refund queue.
       : eventType === "order.refunded" ? "refund_required"
       : null;
-    const result = orderStore.applyProviderWebhook({
-      webhookId,
-      outTradeNo: payloadOrder.client_order_id || event.client_order_id,
-      providerOrderId: payloadOrder.order_id || payloadOrder.id || event.order_id,
-      orderVersion: payloadOrder.order_version ?? event.order_version,
-      eventType,
-      ...(status ? { status } : {}),
-      payload: event,
-      patch: status ? { nextRetryAt: null, needsManualAction: status === "refund_required" } : {}
-    });
+    if (!status) return json(res, 200, { ok: true, ignored: true, message: "未识别的供应商事件" });
+    let result;
+    try {
+      const receivedAt = new Date().toISOString();
+      result = orderStore.applyProviderWebhook({
+        webhookId,
+        outTradeNo: payloadOrder.client_order_id || event.client_order_id,
+        providerOrderId: payloadOrder.order_id || payloadOrder.id || event.order_id,
+        orderVersion: payloadOrder.order_version ?? event.order_version,
+        eventType,
+        status,
+        payload: event,
+        patch: {
+          nextRetryAt: null,
+          providerCheckedAt: receivedAt,
+          statusUpdatedAt: receivedAt,
+          needsManualAction: status === "refund_required"
+        }
+      });
+    } catch (error) {
+      if (error?.code === "WEBHOOK_ORDER_NOT_FOUND") {
+        return json(res, 503, { ok: false, message: "订单尚未就绪，请稍后重试" });
+      }
+      throw error;
+    }
     return json(res, 200, { ok: true, duplicate: result.reason === "duplicate", applied: result.applied });
   }
   return json(res, 404, { ok: false, message: "接口不存在" });
@@ -1576,7 +1693,21 @@ async function scheduledMaintenance() {
     }
     try {
       const fx = await readJson(fxFile, null);
-      if (shouldRefreshFxRate(fx, { now, lastAttemptAt: lastScheduledFxRefreshAttemptAt })) {
+      const normalIntervalMs = fxRefreshIntervalMinutes(fx) * 60 * 1000;
+      let providerSelectionChanged = false;
+      try {
+        const selected = selectFxProvider(process.env);
+        providerSelectionChanged = Boolean(fx?.idrPerCny) && fx?.provider !== selected.provider;
+      } catch {
+        // refreshFxRate will surface the provider configuration error when a
+        // refresh is otherwise due; a bad configuration must not crash the
+        // rest of the maintenance cycle.
+      }
+      if (providerSelectionChanged || shouldRefreshFxRate(fx, {
+        now,
+        lastAttemptAt: lastScheduledFxRefreshAttemptAt,
+        normalIntervalMs
+      })) {
         lastScheduledFxRefreshAttemptAt = now;
         await refreshFxRate("scheduled");
       }
@@ -1602,8 +1733,16 @@ try {
 } catch (error) {
   console.error("Stored product availability migration failed:", error.message);
 }
+try {
+  await migrateStoredPublicationHistory();
+} catch (error) {
+  console.error("Stored product publication-history migration failed:", error.message);
+}
 server.listen(port, () => console.log(`Panxiang Recharge listening on http://localhost:${port}`));
 setTimeout(scheduledMaintenance, 5000).unref();
 setInterval(scheduledMaintenance, 30 * 60 * 1000).unref();
-setTimeout(() => processPendingRecharges().catch((error) => console.error("Initial recharge recovery failed:", error.message)), 10000).unref();
-setInterval(() => processPendingRecharges().catch((error) => console.error("Recharge recovery failed:", error.message)), 60 * 1000).unref();
+setTimeout(() => processPendingRecharges().catch((error) => console.error("Initial recharge recovery failed:", error.message)), 5000).unref();
+// Webhook normally updates the order immediately. This recovery loop closes
+// the gap quickly when a callback is delayed or lost; per-order nextRetryAt
+// still applies exponential backoff, so the supplier is not polled every run.
+setInterval(() => processPendingRecharges().catch((error) => console.error("Recharge recovery failed:", error.message)), 15 * 1000).unref();

@@ -13,6 +13,8 @@ const state = {
   productPage: 1,
   productPageSize: 100,
   section: "products",
+  ordersPollTimer: null,
+  ordersLoading: false,
   fx: null,
   status: null
 };
@@ -322,22 +324,58 @@ function publishedProductAvailability(product) {
   if (product.storefrontVisible === true) {
     return { sellable: true, label: "前台可售", reason: "用户可正常购买" };
   }
+  const readiness = productPublicationReadiness(product);
+  if (!readiness.ready) return { sellable: false, label: "暂不可售", reason: readiness.reason };
+  return { sellable: false, label: "暂不可售", reason: "商品配置完整，等待前台状态同步" };
+}
+
+function productPublicationReadiness(product) {
   if (product.active !== true) {
-    return { sellable: false, label: "暂不可售", reason: product.unavailableReason || "最近确认的完整目录中已缺失" };
+    return { ready: false, reason: product.unavailableReason || "最近确认的完整目录中已缺失" };
   }
   if (!["airtime", "data"].includes(String(product.category || ""))) {
-    return { sellable: false, label: "暂不可售", reason: "尚未选择话费或流量分类" };
+    return { ready: false, reason: "尚未选择话费或流量分类" };
   }
   if (!String(product.operator || "").trim() || String(product.operator).trim() === "未知运营商") {
-    return { sellable: false, label: "暂不可售", reason: "尚未填写运营商" };
+    return { ready: false, reason: "尚未填写运营商" };
   }
   if ((product.sourceEligible ?? product.eligible) !== true && product.manualCatalogApproved !== true) {
-    return { sellable: false, label: "暂不可售", reason: product.excludeReason || "尚未确认是印尼通信套餐" };
+    return { ready: false, reason: product.excludeReason || "尚未确认是印尼通信套餐" };
   }
   if (productSellPrice(product) === null) {
-    return { sellable: false, label: "暂不可售", reason: product.autoPriceReason || "售价尚未生成" };
+    return { ready: false, reason: product.autoPriceReason || "售价尚未生成" };
   }
-  return { sellable: false, label: "暂不可售", reason: "当前未通过前台可售校验" };
+  return { ready: true, reason: "可重新上架" };
+}
+
+function historicalPublishedProducts() {
+  return state.products
+    .filter((product) => product.published !== true && (
+      product.everPublished === true
+      || Boolean(product.firstPublishedAt)
+      || Boolean(product.lastPublishedAt)
+      || Boolean(product.lastUnpublishedAt)
+    ))
+    .sort((left, right) => {
+      const rightTime = Date.parse(right.lastUnpublishedAt || right.lastPublishedAt || right.firstPublishedAt || 0) || 0;
+      const leftTime = Date.parse(left.lastUnpublishedAt || left.lastPublishedAt || left.firstPublishedAt || 0) || 0;
+      return rightTime - leftTime || String(left.sku || "").localeCompare(String(right.sku || ""));
+    });
+}
+
+function publishedPriceEditor(product) {
+  const automatic = product.priceMode !== "manual";
+  const displayedPrice = automatic
+    ? (product.autoPriceCny ?? productSellPrice(product))
+    : (product.priceCny ?? productSellPrice(product));
+  const reason = automatic
+    ? (displayedPrice == null ? (product.autoPriceReason || "汇率或买入价尚未就绪") : "按后台自动定价规则计算")
+    : "手动售价，单位人民币";
+  return `<div class="published-price-editor">
+    <select class="table-select published-price-mode" aria-label="价格模式"><option value="auto" ${automatic ? "selected" : ""}>自动定价</option><option value="manual" ${automatic ? "" : "selected"}>手动定价</option></select>
+    <div class="published-price-entry"><span>¥</span><input class="table-input published-price-input" type="number" min="0.01" step="0.01" inputmode="decimal" value="${displayedPrice == null ? "" : escapeHtml(Number(displayedPrice).toFixed(2))}" ${automatic ? "readonly" : ""} placeholder="售价"></div>
+    <div class="subline published-price-help">${escapeHtml(reason)}</div>
+  </div>`;
 }
 
 function publishedProductRow(product, index, total) {
@@ -348,10 +386,24 @@ function publishedProductRow(product, index, total) {
     <td><button class="drag-handle" type="button" aria-label="拖动 ${escapeHtml(product.name || product.sku)}" title="按住拖动">⠿</button></td>
     <td><div class="sku-title">${escapeHtml(product.name || product.sku)}</div><div class="subline">${escapeHtml(product.sku)}</div></td>
     <td><div>${escapeHtml(product.operator || "未知运营商")}</div><span class="category-badge ${escapeHtml(product.category || "airtime")}">${category}</span></td>
-    <td class="money">${escapeHtml(formatMoney(productSellPrice(product)))}</td>
+    <td>${publishedPriceEditor(product)}</td>
     <td><span class="sale-state ${availability.sellable ? "sellable" : "unavailable"}">${availability.label}</span><div class="sale-reason">${escapeHtml(availability.reason)}</div></td>
     <td>${product.popular ? '<span class="status-badge popular">热门推荐</span>' : '<span class="subline">普通展示</span>'}</td>
     <td><div class="order-buttons"><button class="mini-button move-published" type="button" data-delta="-1" ${index === 0 ? "disabled" : ""}>上移</button><button class="mini-button move-published" type="button" data-delta="1" ${index === total - 1 ? "disabled" : ""}>下移</button></div></td>
+    <td><div class="published-row-actions"><button class="mini-button save-published-price" type="button">保存价格</button><button class="mini-button danger unpublish-from-list" type="button">下架</button></div></td>
+  </tr>`;
+}
+
+function historicalPublishedProductRow(product) {
+  const category = product.category === "data" ? "流量套餐" : product.category === "airtime" ? "话费充值" : "待分类";
+  const readiness = productPublicationReadiness(product);
+  return `<tr class="published-history-row" data-sku="${escapeHtml(product.sku)}">
+    <td><div class="sku-title">${escapeHtml(product.name || product.sku)}</div><div class="subline">${escapeHtml(product.sku)}</div></td>
+    <td><div>${escapeHtml(formatDate(product.lastUnpublishedAt || product.lastPublishedAt, "—"))}</div><div class="subline">首次上架 ${escapeHtml(formatDate(product.firstPublishedAt, "—"))}</div></td>
+    <td><div>${escapeHtml(product.operator || "未知运营商")}</div><span class="category-badge ${escapeHtml(product.category || "unclassified")}">${category}</span></td>
+    <td>${publishedPriceEditor(product)}</td>
+    <td><span class="sale-state ${readiness.ready ? "sellable" : "unavailable"}">${readiness.ready ? "可重新上架" : "暂不可上架"}</span><div class="sale-reason">${escapeHtml(readiness.reason)}</div></td>
+    <td><div class="published-row-actions"><button class="mini-button save-published-price" type="button">保存价格</button><button class="button primary republish-product" type="button" ${readiness.ready ? "" : "disabled"}>重新上架</button></div></td>
   </tr>`;
 }
 
@@ -382,8 +434,115 @@ function dropPublishedProduct(sourceSku, targetSku, after) {
   setPublishedOrder(next);
 }
 
+function updatePublishedPriceEditor(row) {
+  const product = state.products.find((item) => String(item.sku) === String(row.dataset.sku));
+  const select = $(".published-price-mode", row);
+  const input = $(".published-price-input", row);
+  const help = $(".published-price-help", row);
+  if (!product || !select || !input) return;
+  const automatic = select.value !== "manual";
+  input.readOnly = automatic;
+  input.value = automatic
+    ? (product.autoPriceCny == null ? "" : Number(product.autoPriceCny).toFixed(2))
+    : (product.priceCny ?? product.autoPriceCny ?? "");
+  if (help) help.textContent = automatic
+    ? (input.value ? "按后台自动定价规则计算" : (product.autoPriceReason || "汇率或买入价尚未就绪"))
+    : "手动售价，单位人民币";
+  if (!automatic) input.focus();
+}
+
+function publishedPricePayload(row, product, { requireReadyPrice = false } = {}) {
+  const priceMode = $(".published-price-mode", row)?.value === "manual" ? "manual" : "auto";
+  const input = $(".published-price-input", row);
+  const payload = { priceMode };
+  if (priceMode === "manual") {
+    payload.priceCny = Number(input?.value);
+    if (!Number.isFinite(payload.priceCny) || payload.priceCny <= 0) throw new Error("请输入有效的手动售价");
+  } else if (requireReadyPrice && (!Number.isFinite(Number(product?.autoPriceCny)) || Number(product.autoPriceCny) <= 0)) {
+    throw new Error(product?.autoPriceReason || "自动价格尚未生成，请先刷新汇率");
+  }
+  return payload;
+}
+
+function applyPublishedMutationResult(sku, result, { publicationChanged = false, nextPublished = null } = {}) {
+  const productIndex = state.products.findIndex((item) => String(item.sku) === String(sku));
+  if (productIndex >= 0 && result?.product) state.products[productIndex] = result.product;
+  const serverOrder = result?.publishedOrder && typeof result.publishedOrder === "object" ? result.publishedOrder : {};
+  if (serverOrder.revision !== undefined) state.orderRevision = serverOrder.revision;
+  renderProducts();
+  if (publicationChanged) {
+    const fallbackOrder = nextPublished
+      ? [...state.publishedOrder.filter((item) => item !== String(sku)), String(sku)]
+      : state.publishedOrder.filter((item) => item !== String(sku));
+    resetPublishedOrderFromProducts(Array.isArray(serverOrder.skus) ? serverOrder.skus : fallbackOrder);
+  } else {
+    renderPublishedProducts();
+  }
+}
+
+async function mutatePublishedProduct(button, action) {
+  const row = button.closest("tr");
+  const sku = String(row?.dataset.sku || "");
+  const product = state.products.find((item) => String(item.sku) === sku);
+  const publicationChanged = action === "unpublish" || action === "republish";
+  if (!row || !product) return;
+  if (publicationChanged && publishedOrderIsDirty()) {
+    notify("请先保存或恢复当前前台排序，再调整商品上下架", "error");
+    return;
+  }
+  if (productMutationsInFlight.has(sku)) {
+    notify(`${sku} 正在保存，请稍候`, "error");
+    return;
+  }
+
+  let payload;
+  try {
+    if (action === "unpublish") payload = { published: false };
+    else {
+      payload = publishedPricePayload(row, product, { requireReadyPrice: action === "republish" });
+      if (action === "republish") payload.published = true;
+    }
+  } catch (error) {
+    notify(error.message, "error");
+    return;
+  }
+
+  const labels = action === "unpublish"
+    ? ["下架中…", `${sku} 已下架`]
+    : action === "republish"
+      ? ["上架中…", `${sku} 已重新上架`]
+      : ["保存中…", `${sku} 售价已保存`];
+  productMutationsInFlight.add(sku);
+  setButtonBusy(button, true, labels[0]);
+  try {
+    const result = await api(`/api/admin/products/${encodeURIComponent(sku)}`, {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    });
+    productMutationsInFlight.delete(sku);
+    setButtonBusy(button, false);
+    applyPublishedMutationResult(sku, result, {
+      publicationChanged,
+      nextPublished: action === "republish"
+    });
+    notify(labels[1]);
+  } catch (error) {
+    productMutationsInFlight.delete(sku);
+    setButtonBusy(button, false);
+    notify(error.message, "error");
+  }
+}
+
+function bindPublishedProductControls(root) {
+  $$(".published-price-mode", root).forEach((select) => select.addEventListener("change", () => updatePublishedPriceEditor(select.closest("tr"))));
+  $$(".save-published-price", root).forEach((button) => button.addEventListener("click", () => mutatePublishedProduct(button, "save")));
+  $$(".unpublish-from-list", root).forEach((button) => button.addEventListener("click", () => mutatePublishedProduct(button, "unpublish")));
+  $$(".republish-product", root).forEach((button) => button.addEventListener("click", () => mutatePublishedProduct(button, "republish")));
+}
+
 function renderPublishedProducts() {
   const products = publishedProductsInOrder();
+  const history = historicalPublishedProducts();
   const sellableCount = products.filter((product) => product.storefrontVisible === true).length;
   const unavailableCount = products.length - sellableCount;
   $("#publishedOrderCount").textContent = products.length.toLocaleString("zh-CN");
@@ -394,7 +553,11 @@ function renderPublishedProducts() {
   warning.innerHTML = unavailableCount === 0 ? "" : `<strong>${unavailableCount} 个已设置上架的套餐暂不可售</strong><span>具体原因已逐行标明；可到商品中心补全配置。</span><button class="text-link go-products" type="button">前往商品中心</button>`;
   $("#publishedOrderRows").innerHTML = products.length
     ? products.map((product, index) => publishedProductRow(product, index, products.length)).join("")
-    : '<tr><td colspan="8" class="empty-state">暂无已设置上架的套餐，请先到商品中心选择商品上架</td></tr>';
+    : '<tr><td colspan="9" class="empty-state">暂无已设置上架的套餐，请先到商品中心选择商品上架</td></tr>';
+  $("#publishedHistoryCount").textContent = `${history.length.toLocaleString("zh-CN")} 个历史商品`;
+  $("#publishedHistoryRows").innerHTML = history.length
+    ? history.map(historicalPublishedProductRow).join("")
+    : '<tr><td colspan="6" class="empty-state">暂无历史上架商品；商品首次下架后会保留在这里</td></tr>';
 
   const dirty = publishedOrderIsDirty();
   const saveButton = $("#savePublishedOrder");
@@ -435,6 +598,8 @@ function renderPublishedProducts() {
   });
   const goProducts = $(".go-products", warning);
   if (goProducts) goProducts.addEventListener("click", () => switchSection("products"));
+  bindPublishedProductControls($("#publishedOrderRows"));
+  bindPublishedProductControls($("#publishedHistoryRows"));
 }
 
 async function savePublishedOrder() {
@@ -900,7 +1065,7 @@ function renderOrders() {
     <td class="money">${escapeHtml(formatMoney(order.price, order.currency || "CNY"))}</td>
     <td><span class="order-status ${orderStatusClass(order.status)}">${escapeHtml(orderLabels[order.status] || order.status || "未知")}</span>${order.provider?.data?.data?.order?.order_id ? `<div class="subline">ReloadN: ${escapeHtml(order.provider.data.data.order.order_id)}</div>` : ""}</td>
     <td>${escapeHtml(formatDate(order.createdAt))}</td>
-    <td>${escapeHtml(formatDate(order.updatedAt || order.createdAt))}</td>
+    <td>${escapeHtml(formatDate(order.statusUpdatedAt || order.updatedAt || order.createdAt))}</td>
     <td>${canRetry ? `<button class="mini-button retry-order" data-order-id="${escapeHtml(order.id)}">重新提交/查单</button>` : "—"}</td>
   </tr>`;
   }).join("") : '<tr><td colspan="8" class="empty-state">暂无符合条件的订单</td></tr>';
@@ -921,11 +1086,43 @@ async function retryOrder(button) {
   }
 }
 
+const ORDER_FAST_POLL_STATUSES = new Set(["payment_pending", "paid_pending_recharge", "recharge_processing"]);
+const ORDER_SLOW_POLL_STATUSES = new Set(["refund_required", "manual_review"]);
+
+function scheduleOrderRefresh(delayMs) {
+  clearTimeout(state.ordersPollTimer);
+  state.ordersPollTimer = null;
+  if (state.section !== "orders" || !Number.isFinite(delayMs) || delayMs <= 0) return;
+  state.ordersPollTimer = setTimeout(() => {
+    loadOrders(false).catch((error) => notify(error.message, "error"));
+  }, delayMs);
+}
+
+function nextOrderRefreshDelay(orders = state.orders) {
+  if (orders.some((order) => ORDER_FAST_POLL_STATUSES.has(order.status))) return 10_000;
+  if (orders.some((order) => ORDER_SLOW_POLL_STATUSES.has(order.status))) return 45_000;
+  return null;
+}
+
 async function loadOrders(showMessage = false) {
-  const data = await api("/api/admin/orders");
-  state.orders = Array.isArray(data.orders) ? data.orders : [];
-  renderOrders();
-  if (showMessage) notify("订单列表已刷新");
+  if (state.ordersLoading) return;
+  state.ordersLoading = true;
+  clearTimeout(state.ordersPollTimer);
+  state.ordersPollTimer = null;
+  try {
+    const data = await api("/api/admin/orders");
+    state.orders = Array.isArray(data.orders) ? data.orders : [];
+    renderOrders();
+    if (showMessage) notify("订单列表已刷新");
+    scheduleOrderRefresh(nextOrderRefreshDelay());
+  } catch (error) {
+    // A temporary network/API failure must not silently stop monitoring. Retry
+    // sooner than the normal low-frequency cycle while the order page remains open.
+    scheduleOrderRefresh(15_000);
+    throw error;
+  } finally {
+    state.ordersLoading = false;
+  }
 }
 
 function auditLabel(action) {
@@ -1038,6 +1235,10 @@ async function savePricingRule() {
 }
 
 async function switchSection(section) {
+  if (section !== "orders") {
+    clearTimeout(state.ordersPollTimer);
+    state.ordersPollTimer = null;
+  }
   state.section = section;
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.section === section));
   $$(".section").forEach((element) => element.classList.toggle("active", element.id === `section-${section}`));
