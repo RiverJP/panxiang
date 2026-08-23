@@ -94,6 +94,26 @@ test("infers the next offset from offset, limit and total", async () => {
   });
 });
 
+test("does not truncate a 102-item catalogue when only total and limit are returned", async () => {
+  await withProductTypes("all", async () => {
+    const calls = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ sku: `SKU-${index + 1}` }));
+    const result = await listAllSupplierProducts({ request: queuedRequester([
+      { data: { items: firstPage, meta: { total: 102, limit: 100 } } },
+      { data: { items: [{ sku: "SKU-101" }, { sku: "SKU-102" }], meta: { total: 102, limit: 100 } } }
+    ], calls) });
+
+    assert.deepEqual(calls.map((call) => call.query), [
+      {},
+      { limit: 100, offset: 100 }
+    ]);
+    assert.equal(result.items.length, 102);
+    assert.equal(result.pages, 2);
+    assert.equal(result.complete, true);
+    assert.deepEqual(result.pagination[0].strategies, ["offset-total"]);
+  });
+});
+
 test("respects an explicit has_more false even if a stale cursor is present", async () => {
   await withProductTypes("topup", async () => {
     let calls = 0;

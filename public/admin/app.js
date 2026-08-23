@@ -11,7 +11,7 @@ const state = {
   orderRevision: "",
   draggedPublishedSku: "",
   productPage: 1,
-  productPageSize: 100,
+  productPageSize: 200,
   section: "products",
   ordersPollTimer: null,
   ordersLoading: false,

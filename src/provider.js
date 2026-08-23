@@ -192,7 +192,7 @@ function queryFromNextLink(field, pathname) {
   return Object.fromEntries(url.searchParams.entries());
 }
 
-function supplierPagination(response, currentQuery, pathname = "/v1/products") {
+function supplierPagination(response, currentQuery, pathname = "/v1/products", progress = {}) {
   const cursorField = paginationField(response, ["next_cursor", "nextCursor"]);
   const tokenField = paginationField(response, ["next_page_token", "nextPageToken", "next_token", "nextToken"]);
   const nextPageField = paginationField(response, ["next_page", "nextPage"]);
@@ -212,6 +212,9 @@ function supplierPagination(response, currentQuery, pathname = "/v1/products") {
     : String(tokenField.value);
   const hasMore = truthyPaginationFlag(hasMoreField);
   const total = totalField.known ? positiveInteger(totalField.value) : null;
+  const pageItemCount = positiveInteger(progress.pageItemCount) ?? 0;
+  const fetchedCount = positiveInteger(progress.fetchedCount) ?? 0;
+  const effectiveLimit = positiveInteger(limitField.value) ?? positiveInteger(currentQuery.limit);
   const scope = paginationScopeQuery(currentQuery);
   let nextQuery = null;
   let strategy = "unknown";
@@ -236,8 +239,7 @@ function supplierPagination(response, currentQuery, pathname = "/v1/products") {
       const nextPage = positiveInteger(nextPageField.value);
       const currentPage = positiveInteger(currentPageField.value);
       const lastPage = positiveInteger(lastPageField.value);
-      const limit = positiveInteger(limitField.value);
-      const morePagesByTotal = currentPage !== null && limit && total !== null && currentPage * limit < total;
+      const morePagesByTotal = currentPage !== null && effectiveLimit && total !== null && currentPage * effectiveLimit < total;
       if (nextPage !== null) {
         nextQuery = { ...scope, page: nextPage };
         strategy = "page";
@@ -247,16 +249,31 @@ function supplierPagination(response, currentQuery, pathname = "/v1/products") {
       } else {
         const nextOffset = positiveInteger(nextOffsetField.value);
         const currentOffset = positiveInteger(offsetField.value);
-        const moreOffsetsByTotal = currentOffset !== null && limit && total !== null && currentOffset + limit < total;
+        const moreOffsetsByTotal = currentOffset !== null && effectiveLimit && total !== null && currentOffset + effectiveLimit < total;
         if (nextOffset !== null) {
           nextQuery = { ...scope, offset: nextOffset };
           strategy = "offset";
-        } else if (currentOffset !== null && limit && (hasMore === true || moreOffsetsByTotal)) {
-          nextQuery = { ...scope, offset: currentOffset + limit };
+        } else if (currentOffset !== null && effectiveLimit && (hasMore === true || moreOffsetsByTotal)) {
+          nextQuery = { ...scope, offset: currentOffset + effectiveLimit };
           strategy = "offset";
         }
       }
     }
+  }
+
+  // Some ReloadN catalogue responses expose only `total` and `limit`: the
+  // first page contains 100 rows, but there is no cursor/current-page/offset
+  // marker. Infer the next offset from the rows actually returned so a 102-SKU
+  // catalogue is not silently truncated at 100. Explicit pagination markers
+  // above always take precedence, and an explicit `has_more: false` stops here.
+  if (!nextQuery && hasMore !== false && total !== null && fetchedCount < total && pageItemCount > 0) {
+    const queryOffset = positiveInteger(currentQuery.offset) ?? 0;
+    nextQuery = {
+      ...scope,
+      ...(effectiveLimit ? { limit: effectiveLimit } : {}),
+      offset: queryOffset + pageItemCount
+    };
+    strategy = "offset-total";
   }
 
   const terminalMarker = (nextLinkField.known && !linkedQuery)
@@ -320,7 +337,10 @@ export async function listAllSupplierProducts({ request = supplierRequest } = {}
         }
       }
       fetched = typeSkus.size;
-      const pageInfo = supplierPagination(response, query);
+      const pageInfo = supplierPagination(response, query, "/v1/products", {
+        pageItemCount: items.length,
+        fetchedCount: fetched
+      });
       if (pageInfo.strategy !== "unknown") strategies.add(pageInfo.strategy);
       if (pageInfo.total !== null) expectedTotal = pageInfo.total;
       if (!pageInfo.nextQuery) {

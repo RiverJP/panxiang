@@ -26,7 +26,7 @@ npm start
 
 程序启动时会自动读取项目根目录的 `.env`（系统环境变量优先）。打开 `http://localhost:3000`。
 
-`SUPPLIER_PRODUCT_TYPES=topup` 使用 ReloadN 文档明确提供的完整充值目录。若 ReloadN 后续为商户开通其他商品类型，可用英文逗号追加类型；只有供应商明确支持无类型查询时才使用 `all`。后台每页最多渲染 100 个 SKU，供应商原始响应不会发送到浏览器。
+`SUPPLIER_PRODUCT_TYPES=topup` 使用 ReloadN 文档明确提供的完整充值目录。若 ReloadN 后续为商户开通其他商品类型，可用英文逗号追加类型；只有供应商明确支持无类型查询时才使用 `all`。商品同步会继续跟随游标、页码、offset，供应商只返回 `total + limit` 时也会按累计 offset 拉完。后台每页最多渲染 200 个 SKU，供应商原始响应不会发送到浏览器。
 
 ReloadN 的商品价格使用商户账户结算币种，但不会在每条 SKU 中重复返回币种。本项目的 ReloadN 账户以 IDR 结算，因此生产环境需设置 `SUPPLIER_ACCOUNT_CURRENCY=IDR`。修改该配置或更新价格解析代码后，应在后台重新执行一次“同步 ReloadN SKU”，让已保存商品重新生成买入价和自动售价。
 
