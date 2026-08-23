@@ -1,3 +1,5 @@
+export const defaultCustomerServiceUrl = "https://work.weixin.qq.com/kfid/kfcd7c68ab23401a2ba";
+
 export function normalizeCustomerServiceUrl(value) {
   const configured = String(value || "").trim();
   if (!configured) return "";

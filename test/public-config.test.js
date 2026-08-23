@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeCustomerServiceUrl } from "../src/public-config.js";
+import { defaultCustomerServiceUrl, normalizeCustomerServiceUrl } from "../src/public-config.js";
+
+test("ships with the configured Panxiang customer service link", () => {
+  assert.equal(defaultCustomerServiceUrl, "https://work.weixin.qq.com/kfid/kfcd7c68ab23401a2ba");
+});
 
 test("accepts official WeCom customer service and contact links", () => {
   assert.equal(normalizeCustomerServiceUrl("https://work.weixin.qq.com/kf/example?enc_scene=abc"), "https://work.weixin.qq.com/kf/example?enc_scene=abc");

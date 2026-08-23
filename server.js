@@ -25,7 +25,7 @@ import {
   normalizeCatalogOrderRequest,
   normalizeCatalogSortOrder
 } from "./src/catalog-display.js";
-import { normalizeCustomerServiceUrl } from "./src/public-config.js";
+import { defaultCustomerServiceUrl, normalizeCustomerServiceUrl } from "./src/public-config.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(root, ".env");
@@ -983,7 +983,7 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, service: "panxiang-recharge", time: new Date().toISOString() });
   }
   if (req.method === "GET" && url.pathname === "/api/public-config") {
-    return json(res, 200, { ok: true, customerServiceUrl: normalizeCustomerServiceUrl(process.env.WECOM_CUSTOMER_SERVICE_URL) });
+    return json(res, 200, { ok: true, customerServiceUrl: normalizeCustomerServiceUrl(process.env.WECOM_CUSTOMER_SERVICE_URL || defaultCustomerServiceUrl) });
   }
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     const managed = await readJson(productsFile, []);
