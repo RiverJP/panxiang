@@ -4,10 +4,69 @@ import {
   supplierStatusToLocal,
   normalizeSupplierOrderStatus,
   isActiveRechargeStatus,
+  isPendingWechatPaymentStatus,
+  paymentPollDelayMs,
+  nextPaymentPollAt,
+  shouldActivelyReconcilePayment,
   processingPollDelayMs,
   nextProcessingPollAt,
   shouldActivelyRefreshOrder
 } from "../src/order-status.js";
+
+test("only payment_pending orders are eligible for active WeChat reconciliation", () => {
+  assert.equal(isPendingWechatPaymentStatus("payment_pending"), true);
+  assert.equal(isPendingWechatPaymentStatus("pending_payment"), false);
+  assert.equal(isPendingWechatPaymentStatus("paid_pending_recharge"), false);
+  assert.equal(shouldActivelyReconcilePayment({ status: "payment_pending" }), true);
+  assert.equal(shouldActivelyReconcilePayment({ status: "pending_payment" }), false);
+  assert.equal(shouldActivelyReconcilePayment({ status: "recharge_processing" }), false);
+});
+
+test("backs off pending WeChat payment polls from 15 seconds to five minutes", () => {
+  assert.equal(paymentPollDelayMs(0), 15_000);
+  assert.equal(paymentPollDelayMs(1), 30_000);
+  assert.equal(paymentPollDelayMs(2), 60_000);
+  assert.equal(paymentPollDelayMs(3), 120_000);
+  assert.equal(paymentPollDelayMs(4), 240_000);
+  assert.equal(paymentPollDelayMs(5), 300_000);
+  assert.equal(paymentPollDelayMs(99), 300_000);
+  assert.equal(
+    nextPaymentPollAt(1, { now: Date.parse("2026-08-24T00:00:00.000Z") }),
+    "2026-08-24T00:00:30.000Z"
+  );
+});
+
+test("respects nextPaymentCheckAt and falls back to paymentCheckedAt throttling", () => {
+  const now = Date.parse("2026-08-24T00:01:00.000Z");
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    nextPaymentCheckAt: "2026-08-24T00:01:30.000Z"
+  }, { now }), false);
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    nextPaymentCheckAt: "2026-08-24T00:01:00.000Z"
+  }, { now }), true);
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    paymentCheckedAt: "2026-08-24T00:00:50.000Z"
+  }, { now }), false);
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    paymentCheckedAt: "2026-08-24T00:00:45.000Z"
+  }, { now }), true);
+});
+
+test("future clock corruption cannot suppress WeChat reconciliation forever", () => {
+  const now = Date.parse("2026-08-24T00:00:00.000Z");
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    nextPaymentCheckAt: "2026-08-25T00:00:00.000Z"
+  }, { now }), true);
+  assert.equal(shouldActivelyReconcilePayment({
+    status: "payment_pending",
+    paymentCheckedAt: "2026-08-25T00:00:00.000Z"
+  }, { now }), true);
+});
 
 test("maps successful, failed and refunded supplier states", () => {
   assert.equal(supplierStatusToLocal("SUCCESS"), "recharge_success");

@@ -17,23 +17,46 @@ function authHeader(method, path, body, privateKey) {
 }
 
 export async function wechatRequest(method, path, payload) {
-  const body = payload === undefined ? "" : JSON.stringify(payload);
+  const normalizedMethod = String(method || "").toUpperCase();
+  const hasBody = payload !== undefined && normalizedMethod !== "GET" && normalizedMethod !== "HEAD";
+  const body = hasBody ? JSON.stringify(payload) : "";
   const privateKey = await readKey(process.env.WECHAT_PRIVATE_KEY_PATH);
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
+  const requestOptions = {
+    method: normalizedMethod,
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
-      Authorization: authHeader(method, path, body, privateKey),
+      Authorization: authHeader(normalizedMethod, path, body, privateKey),
       "User-Agent": "panxiang-recharge/1.0"
     },
-    body,
     signal: AbortSignal.timeout(15000)
-  });
+  };
+  if (hasBody) requestOptions.body = body;
+  const response = await fetch(`${baseUrl}${path}`, requestOptions);
   const text = await response.text();
   let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
   if (!response.ok) { const error = new Error(`WeChat Pay ${response.status}`); error.details = data; throw error; }
   return data;
+}
+
+function encodeRfc3986(value) {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+export async function queryJsapiTransactionByOutTradeNo(
+  outTradeNo,
+  { requestImpl = wechatRequest, mchid = process.env.WECHAT_MCHID } = {}
+) {
+  const normalizedOutTradeNo = String(outTradeNo ?? "").trim();
+  const normalizedMchid = String(mchid ?? "").trim();
+  if (!normalizedOutTradeNo) throw new Error("微信商户订单号不能为空");
+  if (!normalizedMchid) throw new Error("微信商户号未配置");
+  if (typeof requestImpl !== "function") throw new TypeError("微信支付请求函数无效");
+
+  const path = `/v3/pay/transactions/out-trade-no/${encodeRfc3986(normalizedOutTradeNo)}?mchid=${encodeRfc3986(normalizedMchid)}`;
+  return requestImpl("GET", path);
 }
 
 export async function createJsapiPrepay({ description, outTradeNo, amountFen, openid, notifyUrl }) {

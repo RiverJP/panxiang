@@ -28,6 +28,8 @@ export const ACTIVE_RECHARGE_STATUSES = Object.freeze([
   "recharge_processing"
 ]);
 
+export const PENDING_WECHAT_PAYMENT_STATUS = "payment_pending";
+
 export function normalizeSupplierOrderStatus(status) {
   return String(status || "")
     .trim()
@@ -45,6 +47,58 @@ export function supplierStatusToLocal(status) {
 
 export function isActiveRechargeStatus(status) {
   return ACTIVE_RECHARGE_STATUSES.includes(String(status || ""));
+}
+
+export function isPendingWechatPaymentStatus(status) {
+  return String(status || "") === PENDING_WECHAT_PAYMENT_STATUS;
+}
+
+/**
+ * Pending WeChat payments are queried progressively less often. This keeps a
+ * newly paid order responsive without letting abandoned payment pages create
+ * an unlimited query stream.
+ */
+export function paymentPollDelayMs(pollCount, { baseMs = 15_000, maxMs = 300_000 } = {}) {
+  const safeBase = Number.isFinite(Number(baseMs)) && Number(baseMs) > 0 ? Number(baseMs) : 15_000;
+  const safeMax = Number.isFinite(Number(maxMs)) && Number(maxMs) >= safeBase ? Number(maxMs) : 300_000;
+  const count = Math.max(0, Math.min(20, Math.trunc(Number(pollCount) || 0)));
+  return Math.min(safeMax, safeBase * (2 ** count));
+}
+
+export function nextPaymentPollAt(pollCount, { now = Date.now(), baseMs, maxMs } = {}) {
+  const timestamp = Number(now);
+  if (!Number.isFinite(timestamp)) throw new TypeError("now 必须是有效时间戳");
+  return new Date(timestamp + paymentPollDelayMs(pollCount, { baseMs, maxMs })).toISOString();
+}
+
+/**
+ * Decide whether a customer/admin request may actively reconcile a pending
+ * payment with WeChat. `nextPaymentCheckAt` is the authoritative backoff when
+ * present; `paymentCheckedAt` supplies a short first-check throttle for legacy
+ * rows. Implausibly far-future timestamps are treated as clock corruption so a
+ * bad server clock cannot suppress reconciliation forever.
+ */
+export function shouldActivelyReconcilePayment(order, {
+  now = Date.now(),
+  minIntervalMs = 15_000,
+  maxFutureSkewMs = 300_000
+} = {}) {
+  if (!order || !isPendingWechatPaymentStatus(order.status)) return false;
+  const timestamp = Number(now);
+  if (!Number.isFinite(timestamp)) return true;
+  const safeFutureSkewMs = Math.max(0, Number(maxFutureSkewMs) || 0);
+
+  const nextCheckTimestamp = Date.parse(order.nextPaymentCheckAt || "");
+  if (Number.isFinite(nextCheckTimestamp)) {
+    if (nextCheckTimestamp - timestamp > safeFutureSkewMs) return true;
+    if (nextCheckTimestamp > timestamp) return false;
+    return true;
+  }
+
+  const checkedTimestamp = Date.parse(order.paymentCheckedAt || "");
+  if (!Number.isFinite(checkedTimestamp)) return true;
+  if (checkedTimestamp - timestamp > safeFutureSkewMs) return true;
+  return timestamp - checkedTimestamp >= Math.max(0, Number(minIntervalMs) || 0);
 }
 
 /**

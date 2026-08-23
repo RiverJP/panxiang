@@ -1,11 +1,16 @@
 export const FX_PROVIDERS = Object.freeze({
   EXCHANGE_RATE_API: "exchange-rate-api",
+  COINBASE: "coinbase",
   OPEN_ER_API: "open-er-api"
 });
 
 const PROVIDER_METADATA = Object.freeze({
   [FX_PROVIDERS.EXCHANGE_RATE_API]: Object.freeze({
     source: "ExchangeRate-API /v6/latest/CNY",
+    recommendedRefreshMinutes: 60
+  }),
+  [FX_PROVIDERS.COINBASE]: Object.freeze({
+    source: "Coinbase current snapshot",
     recommendedRefreshMinutes: 60
   }),
   [FX_PROVIDERS.OPEN_ER_API]: Object.freeze({
@@ -15,6 +20,7 @@ const PROVIDER_METADATA = Object.freeze({
 });
 
 const DEFAULT_EXCHANGE_RATE_API_BASE_URL = "https://v6.exchangerate-api.com/v6";
+const DEFAULT_COINBASE_EXCHANGE_RATE_URL = "https://api.coinbase.com/v2/exchange-rates";
 const DEFAULT_OPEN_ER_API_URL = "https://open.er-api.com/v6/latest/CNY";
 const MAX_LAST_UPDATE_FUTURE_SKEW_SECONDS = 300;
 
@@ -38,6 +44,9 @@ function normalizedProviderName(value) {
   if (["exchange-rate-api", "exchangerate-api", "exchangerate_api"].includes(normalized)) {
     return FX_PROVIDERS.EXCHANGE_RATE_API;
   }
+  if (["coinbase", "coinbase-api", "coinbase_api"].includes(normalized)) {
+    return FX_PROVIDERS.COINBASE;
+  }
   if (["open-er-api", "open.er-api", "open_er_api", "fallback"].includes(normalized)) {
     return FX_PROVIDERS.OPEN_ER_API;
   }
@@ -55,23 +64,26 @@ export function recommendedFxRefreshMinutes(provider, { env = process.env } = {}
   if (!metadata) throw new FxProviderError("FX_CONFIG_ERROR", `Unsupported FX provider: ${provider}`);
   const configured = provider === FX_PROVIDERS.EXCHANGE_RATE_API
     ? env.EXCHANGE_RATE_API_REFRESH_MINUTES
-    : env.OPEN_ER_API_REFRESH_MINUTES;
+    : provider === FX_PROVIDERS.COINBASE
+      ? env.COINBASE_REFRESH_MINUTES
+      : env.OPEN_ER_API_REFRESH_MINUTES;
   return positiveInteger(configured, metadata.recommendedRefreshMinutes, {
-    min: provider === FX_PROVIDERS.EXCHANGE_RATE_API ? 5 : 30
+    min: provider === FX_PROVIDERS.OPEN_ER_API ? 30 : 5
   });
 }
 
 /**
  * Selects the configured provider without returning a secret or a secret-bearing
  * request URL. Supplying EXCHANGE_RATE_API_KEY opts into the keyed provider;
- * otherwise the existing daily open.er-api feed remains available as a
- * degraded fallback.
+ * otherwise Coinbase's keyless current snapshot is used. The existing daily
+ * open.er-api feed remains available as an explicitly selected degraded
+ * fallback.
  */
 export function selectFxProvider(env = process.env) {
   const requested = normalizedProviderName(env.FX_PROVIDER);
   const hasExchangeRateApiKey = Boolean(nonEmptyString(env.EXCHANGE_RATE_API_KEY));
   const provider = requested === "auto"
-    ? (hasExchangeRateApiKey ? FX_PROVIDERS.EXCHANGE_RATE_API : FX_PROVIDERS.OPEN_ER_API)
+    ? (hasExchangeRateApiKey ? FX_PROVIDERS.EXCHANGE_RATE_API : FX_PROVIDERS.COINBASE)
     : requested;
 
   if (provider === FX_PROVIDERS.EXCHANGE_RATE_API && !hasExchangeRateApiKey) {
@@ -120,6 +132,17 @@ function providerRequest(provider, env) {
     return { url: base.toString(), headers: { Accept: "application/json" } };
   }
 
+  if (provider === FX_PROVIDERS.COINBASE) {
+    const url = safeHttpsUrl(
+      env.COINBASE_EXCHANGE_RATE_URL,
+      DEFAULT_COINBASE_EXCHANGE_RATE_URL,
+      "COINBASE_EXCHANGE_RATE_URL"
+    );
+    url.search = "";
+    url.searchParams.set("currency", "CNY");
+    return { url: url.toString(), headers: { Accept: "application/json" } };
+  }
+
   const url = safeHttpsUrl(
     env.OPEN_ER_API_URL || env.FX_RATE_URL,
     DEFAULT_OPEN_ER_API_URL,
@@ -156,10 +179,18 @@ function validatedRate(value) {
   return value;
 }
 
+function validatedCoinbaseRate(value) {
+  if (typeof value !== "string" || !/^\d+(?:\.\d+)?$/.test(value.trim())) {
+    throw new FxProviderError("FX_PARSE_ERROR", "Coinbase IDR conversion rate must be a numeric string");
+  }
+  return validatedRate(Number(value));
+}
+
 /**
- * Converts either supported provider payload into the format persisted by the
- * application. Provider timestamps, rather than local fetch time, determine
- * quote freshness.
+ * Converts a supported provider payload into the format persisted by the
+ * application. Timestamped providers preserve their upstream quote time;
+ * Coinbase snapshots use the successful fetch time because that API does not
+ * expose an upstream timestamp.
  */
 export function parseFxQuote(payload, {
   provider,
@@ -172,6 +203,32 @@ export function parseFxQuote(payload, {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new FxProviderError("FX_PARSE_ERROR", "FX provider response must be an object", { provider });
   }
+
+  const checkedNow = validNow(now);
+  if (provider === FX_PROVIDERS.COINBASE) {
+    const data = payload.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new FxProviderError("FX_PARSE_ERROR", "Coinbase FX response data is missing", { provider });
+    }
+    if (data.currency !== "CNY") {
+      throw new FxProviderError("FX_PARSE_ERROR", "Coinbase FX base currency must be CNY", { provider });
+    }
+    if (!data.rates || typeof data.rates !== "object" || Array.isArray(data.rates)) {
+      throw new FxProviderError("FX_PARSE_ERROR", "Coinbase FX rate table is missing", { provider });
+    }
+    const snapshotAt = new Date(checkedNow).toISOString();
+    return {
+      idrPerCny: validatedCoinbaseRate(data.rates.IDR),
+      provider,
+      source: PROVIDER_METADATA[provider].source,
+      providerUpdatedAt: snapshotAt,
+      providerNextUpdateAt: null,
+      fetchedAt: snapshotAt,
+      recommendedRefreshMinutes: recommendedFxRefreshMinutes(provider, { env }),
+      degraded: false
+    };
+  }
+
   if (payload.result !== "success") {
     throw new FxProviderError("FX_PROVIDER_REJECTED", "FX provider did not return a successful result", { provider });
   }
@@ -186,7 +243,6 @@ export function parseFxQuote(payload, {
     throw new FxProviderError("FX_PARSE_ERROR", "FX provider rate table is missing", { provider });
   }
 
-  const checkedNow = validNow(now);
   const last = unixTimestamp(payload.time_last_update_unix, "time_last_update_unix", {
     now: checkedNow
   });

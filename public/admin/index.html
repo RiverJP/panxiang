@@ -172,7 +172,7 @@
         <div class="page-heading"><div><p class="kicker">SYSTEM STATUS</p><h1>系统状态</h1><p>查看自动任务、同步结果、汇率来源和后台操作记录。</p></div><button class="button secondary" id="refreshSystem">刷新状态</button></div>
         <div class="system-grid">
           <section class="admin-panel settings-card">
-            <div class="card-title"><div><h2>汇率与定价</h2><p>自动汇率每 8 小时检查一次；默认免费行情源约每天更新一次。</p></div><span class="status-badge pending" id="fxHealthBadge" title="正在检查汇率与定价状态">检查中</span></div>
+            <div class="card-title"><div><h2>汇率与定价</h2><p>按当前行情源的建议间隔自动更新，也可随时手动刷新。</p></div><span class="status-badge pending" id="fxHealthBadge" title="正在检查汇率与定价状态">检查中</span></div>
             <label class="settings-field"><span>IDR / CNY 汇率</span><div><input id="manualFx" inputmode="decimal" placeholder="例如 2300"><button class="button primary" id="saveFx">保存手动汇率</button></div></label>
             <div class="settings-field">
               <span>自动售价加价规则</span>
@@ -183,7 +183,7 @@
               </div>
               <small class="settings-help" id="pricingRuleHelp">固定金额：自动售价 =（买入价 + 配置值）÷ 汇率；手动定价商品不受影响。</small>
             </div>
-            <dl class="detail-list"><div><dt>当前来源</dt><dd id="fxSource">—</dd></div><div><dt>上游行情时间</dt><dd id="fxProviderUpdated">—</dd></div><div><dt>最近获取/设置</dt><dd id="fxUpdated">—</dd></div><div><dt>自动刷新</dt><dd id="fxRefreshPolicy">正常每 8 小时；异常 30 分钟重试</dd></div></dl>
+            <dl class="detail-list"><div><dt>当前来源</dt><dd id="fxSource">—</dd></div><div><dt>上游行情时间</dt><dd id="fxProviderUpdated">—</dd></div><div><dt>最近获取/设置</dt><dd id="fxUpdated">—</dd></div><div><dt>自动刷新</dt><dd id="fxRefreshPolicy">正在读取行情源刷新策略</dd></div></dl>
           </section>
           <section class="admin-panel settings-card">
             <div class="card-title"><div><h2>供应商同步</h2><p>每天检查一次完整 SKU 目录并跟随分页游标。</p></div><span class="status-badge success">已启用</span></div>

@@ -6,7 +6,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrder, querySupplierOrder, verifyWebhookSignature, listAllSupplierProducts } from "./src/provider.js";
-import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
+import { createJsapiPrepay, buildJsapiPayParams, queryJsapiTransactionByOutTradeNo, verifyAndDecryptNotification } from "./src/wechat.js";
+import { validateSuccessfulWechatPayment, WechatPaymentValidationError } from "./src/wechat-payment.js";
 import { createOrderStore } from "./src/order-store.js";
 import {
   DEFAULT_AUTO_PRICING_RULE,
@@ -35,7 +36,9 @@ import { defaultCustomerServiceUrl, normalizeCustomerServiceUrl } from "./src/pu
 import { MAX_LIFE_SERVICES, compareLifeServices, normalizeLifeService, normalizeLifeServices, publicLifeServices, validateLifeServicesStrict } from "./src/life-services.js";
 import {
   isActiveRechargeStatus,
+  nextPaymentPollAt,
   nextProcessingPollAt,
+  shouldActivelyReconcilePayment,
   shouldActivelyRefreshOrder,
   supplierStatusToLocal
 } from "./src/order-status.js";
@@ -63,6 +66,7 @@ const auditFile = path.join(dataDir, "admin-audit.json");
 const lifeServicesFile = path.join(dataDir, "life-services.json");
 const orderStore = createOrderStore({ dbPath: path.join(dataDir, "orders.sqlite"), legacyJsonPath: ordersFile });
 const rechargeLocks = new Set();
+const paymentReconciliationLocks = new Set();
 let catalogMutationTail = Promise.resolve();
 let fxMutationTail = Promise.resolve();
 let lifeServicesMutationTail = Promise.resolve();
@@ -844,6 +848,141 @@ function safeErrorDetails(error) {
   };
 }
 
+const PAYMENT_ALREADY_ACCEPTED_STATUSES = new Set([
+  "paid_pending_recharge",
+  "recharge_processing",
+  "recharge_success",
+  "refund_required",
+  "manual_review",
+  "refunded"
+]);
+
+function acceptSuccessfulWechatPayment(order, payment, { checkedAt = new Date().toISOString() } = {}) {
+  const owner = order.userId ? orderStore.getWechatUser(order.userId) : null;
+  const verified = validateSuccessfulWechatPayment(order, payment, {
+    appid: process.env.WECHAT_APPID,
+    mchid: process.env.WECHAT_MCHID,
+    owner,
+    now: Date.parse(checkedAt)
+  });
+  const payer = owner || orderStore.upsertWechatUser({
+    appid: payment.appid,
+    openid: verified.payerOpenid
+  });
+  const paymentCheckCount = Math.max(0, Number(order.paymentCheckCount || 0)) + 1;
+  const update = orderStore.updateOrder(order.id, {
+    status: "paid_pending_recharge",
+    transactionId: verified.transactionId,
+    userId: payer.id,
+    payerOpenid: verified.payerOpenid || order.payerOpenid,
+    paidAt: verified.paidAt,
+    paymentSummary: {
+      transactionId: verified.transactionId,
+      amountFen: verified.amountFen,
+      tradeState: verified.tradeState
+    },
+    wechatTradeState: verified.tradeState,
+    paymentCheckedAt: checkedAt,
+    paymentCheckCount,
+    nextPaymentCheckAt: null,
+    lastPaymentQueryError: null,
+    retryCount: Number(order.retryCount || 0),
+    nextRetryAt: checkedAt,
+    statusUpdatedAt: verified.paidAt,
+    updatedAt: checkedAt
+  }, { expectedStatuses: ["pending_payment", "payment_pending"] });
+  return { update, verified };
+}
+
+function pendingPaymentCheckPatch(order, {
+  checkedAt,
+  tradeState = null,
+  error = null
+}) {
+  const paymentCheckCount = Math.max(0, Number(order.paymentCheckCount || 0)) + 1;
+  return {
+    wechatTradeState: tradeState || order.wechatTradeState || null,
+    paymentCheckedAt: checkedAt,
+    paymentCheckCount,
+    nextPaymentCheckAt: nextPaymentPollAt(paymentCheckCount, {
+      now: Date.parse(checkedAt),
+      maxMs: 5 * 60 * 1000
+    }),
+    lastPaymentQueryError: error ? safeErrorDetails(error) : null,
+    updatedAt: checkedAt
+  };
+}
+
+async function reconcileWechatPayment(orderId, { force = false } = {}) {
+  if (paymentReconciliationLocks.has(orderId)) return { skipped: "locked" };
+  paymentReconciliationLocks.add(orderId);
+  try {
+    const order = orderStore.getOrder(orderId);
+    if (!order) return { skipped: "not_found" };
+    if (order.status !== "payment_pending") {
+      return { skipped: PAYMENT_ALREADY_ACCEPTED_STATUSES.has(order.status) ? "already_accepted" : "status", order };
+    }
+    if (!force && !shouldActivelyReconcilePayment(order)) return { skipped: "not_due", order };
+
+    const checkedAt = new Date().toISOString();
+    let payment;
+    try {
+      payment = await queryJsapiTransactionByOutTradeNo(order.id);
+    } catch (error) {
+      const latest = orderStore.getOrder(order.id);
+      if (latest?.status === "payment_pending") {
+        orderStore.updateOrder(order.id, pendingPaymentCheckPatch(latest, { checkedAt, error }), {
+          expectedStatuses: ["payment_pending"]
+        });
+      }
+      return { error: safeErrorDetails(error), retryable: true };
+    }
+
+    const tradeState = String(payment?.trade_state || "").trim().toUpperCase();
+    if (tradeState !== "SUCCESS") {
+      const latest = orderStore.getOrder(order.id);
+      if (latest?.status === "payment_pending") {
+        orderStore.updateOrder(order.id, pendingPaymentCheckPatch(latest, { checkedAt, tradeState }), {
+          expectedStatuses: ["payment_pending"]
+        });
+      }
+      // NOTPAY/USERPAYING and terminal unpaid states must never reach ReloadN.
+      return { paymentState: tradeState || "UNKNOWN", accepted: false };
+    }
+
+    const latest = orderStore.getOrder(order.id);
+    if (!latest || latest.status !== "payment_pending") {
+      return { skipped: PAYMENT_ALREADY_ACCEPTED_STATUSES.has(latest?.status) ? "already_accepted" : "status_changed", order: latest };
+    }
+    let accepted;
+    try {
+      accepted = acceptSuccessfulWechatPayment(latest, payment, { checkedAt });
+    } catch (error) {
+      if (error instanceof WechatPaymentValidationError) {
+        const current = orderStore.getOrder(order.id);
+        if (current?.status === "payment_pending") {
+          orderStore.updateOrder(order.id, pendingPaymentCheckPatch(current, { checkedAt, tradeState, error }), {
+            expectedStatuses: ["payment_pending"]
+          });
+        }
+        return { error: { message: error.message, code: error.code }, retryable: false };
+      }
+      throw error;
+    }
+    if (!accepted.update.updated) {
+      return { skipped: PAYMENT_ALREADY_ACCEPTED_STATUSES.has(accepted.update.order?.status) ? "already_accepted" : "status_changed", order: accepted.update.order };
+    }
+
+    // ReloadN create uses the local order ID as its idempotency key. Calling
+    // the existing processor therefore recovers both "never submitted" and
+    // "submitted but local result was lost" without duplicating a recharge.
+    const recharge = await processRecharge(order.id);
+    return { accepted: true, recharge, order: orderStore.getOrder(order.id) };
+  } finally {
+    paymentReconciliationLocks.delete(orderId);
+  }
+}
+
 function retryableSupplierError(error) {
   if (error?.code === "SUPPLIER_ORDER_NOT_FOUND") return true;
   const status = Number(error?.status || String(error?.message || "").match(/Supplier API (\d+)/)?.[1]);
@@ -934,17 +1073,36 @@ async function processRecharge(orderId, { force = false } = {}) {
 }
 
 async function refreshActiveOrders(orders, { minIntervalMs = 10_000, limit = 20 } = {}) {
-  const candidates = (Array.isArray(orders) ? orders : [])
+  const sourceOrders = Array.isArray(orders) ? orders : [];
+  const paymentCandidates = sourceOrders
+    .filter((order) => shouldActivelyReconcilePayment(order, { minIntervalMs: Math.max(15_000, minIntervalMs) }))
+    .slice(0, limit);
+  for (let index = 0; index < paymentCandidates.length; index += 5) {
+    const batch = paymentCandidates.slice(index, index + 5);
+    await Promise.allSettled(batch.map((order) => reconcileWechatPayment(order.id)));
+  }
+
+  const latestOrders = sourceOrders.map((order) => orderStore.getOrder(order.id) || order);
+  const rechargeCandidates = latestOrders
     .filter((order) => shouldActivelyRefreshOrder(order, { minIntervalMs }))
     .slice(0, limit);
-  for (let index = 0; index < candidates.length; index += 5) {
-    const batch = candidates.slice(index, index + 5);
+  for (let index = 0; index < rechargeCandidates.length; index += 5) {
+    const batch = rechargeCandidates.slice(index, index + 5);
     await Promise.allSettled(batch.map((order) => processRecharge(order.id)));
   }
-  return candidates.length;
+  return paymentCandidates.length + rechargeCandidates.length;
 }
 
 async function processPendingRecharges() {
+  const pendingPayments = orderStore.listOrders({ status: "payment_pending", limit: 1000 })
+    .filter((order) => shouldActivelyReconcilePayment(order))
+    .sort((left, right) => Date.parse(left.nextPaymentCheckAt || left.paymentCheckedAt || left.createdAt || 0) - Date.parse(right.nextPaymentCheckAt || right.paymentCheckedAt || right.createdAt || 0))
+    .slice(0, 20);
+  for (let index = 0; index < pendingPayments.length; index += 5) {
+    const batch = pendingPayments.slice(index, index + 5);
+    await Promise.allSettled(batch.map((order) => reconcileWechatPayment(order.id)));
+  }
+
   const candidates = [
     ...orderStore.listOrders({ status: "paid_pending_recharge", limit: 1000 }),
     ...orderStore.listOrders({ status: "recharge_processing", limit: 1000 })
@@ -1323,10 +1481,12 @@ async function adminApi(req, res, url) {
     const orderId = decodeURIComponent(url.pathname.split("/").at(-2));
     const order = orderStore.getOrder(orderId);
     if (!order) return json(res, 404, { ok: false, message: "订单不存在" });
-    if (!["paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status)) {
-      return json(res, 400, { ok: false, message: "当前订单状态不允许重新提交" });
+    if (!["payment_pending", "paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status)) {
+      return json(res, 400, { ok: false, message: "当前订单状态不允许查单或重新提交" });
     }
-    const result = await processRecharge(orderId, { force: true });
+    const result = order.status === "payment_pending"
+      ? await reconcileWechatPayment(orderId, { force: true })
+      : await processRecharge(orderId, { force: true });
     await appendAudit("order.retry", { orderId, status: orderStore.getOrder(orderId)?.status });
     return json(res, 200, { ok: true, result, order: orderStore.getOrder(orderId) });
   }
@@ -1526,7 +1686,19 @@ async function handleApi(req, res, url) {
       return json(res, 200, { ok: true, orderId: order.id, payment: await buildJsapiPayParams(order.prepayId), replay: true });
     }
     const data = await createJsapiPrepay({ description: order.productLabel.slice(0, 120), outTradeNo: order.id, amountFen, openid });
-    const update = orderStore.updateOrder(order.id, { status: "payment_pending", prepayId: data.prepay_id, payerOpenid: openid, userId: identity.user.id, updatedAt: new Date().toISOString() }, { expectedStatuses: ["pending_payment", "payment_pending"] });
+    const paymentPendingAt = new Date().toISOString();
+    const update = orderStore.updateOrder(order.id, {
+      status: "payment_pending",
+      prepayId: data.prepay_id,
+      payerOpenid: openid,
+      userId: identity.user.id,
+      paymentCheckCount: 0,
+      paymentCheckedAt: null,
+      nextPaymentCheckAt: nextPaymentPollAt(0, { now: Date.parse(paymentPendingAt) }),
+      lastPaymentQueryError: null,
+      statusUpdatedAt: paymentPendingAt,
+      updatedAt: paymentPendingAt
+    }, { expectedStatuses: ["pending_payment", "payment_pending"] });
     if (!update.updated) {
       const current = update.order;
       if (current?.status === "payment_pending" && current.prepayId) {
@@ -1541,37 +1713,17 @@ async function handleApi(req, res, url) {
     const payment = await verifyAndDecryptNotification(raw, req.headers);
     const order = orderStore.getOrder(String(payment.out_trade_no || ""));
     if (!order) return json(res, 500, { code: "FAIL", message: "本地订单不存在，请稍后重试" });
-    const expectedFen = Math.round(Number(order.price) * 100);
-    const payerOpenid = String(payment.payer?.openid || "");
-    const owner = order.userId ? orderStore.getWechatUser(order.userId) : null;
-    const identityMatches = safeEqualText(payment.appid, process.env.WECHAT_APPID)
-      && safeEqualText(payment.mchid, process.env.WECHAT_MCHID)
-      && safeEqualText(payment.amount?.currency, "CNY")
-      && Boolean(payerOpenid)
-      && (!order.payerOpenid || safeEqualText(payerOpenid, order.payerOpenid))
-      && (!owner || (safeEqualText(owner.appid, payment.appid) && safeEqualText(owner.openid, payerOpenid)));
-    if (!identityMatches || payment.trade_state !== "SUCCESS" || Number(payment.amount?.total) !== expectedFen) {
-      return json(res, 400, { code: "FAIL", message: "支付身份、状态或金额不匹配" });
+    let accepted;
+    try {
+      accepted = acceptSuccessfulWechatPayment(order, payment);
+    } catch (error) {
+      if (error instanceof WechatPaymentValidationError) {
+        return json(res, 400, { code: "FAIL", message: error.message });
+      }
+      throw error;
     }
-    if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review", "refunded"].includes(order.status)) return json(res, 200, { code: "SUCCESS", message: "成功" });
-    const transactionId = String(payment.transaction_id || "");
-    if (!transactionId) return json(res, 400, { code: "FAIL", message: "微信支付流水号缺失" });
-    const payer = owner || orderStore.upsertWechatUser({ appid: payment.appid, openid: payerOpenid });
-    const paidAt = payment.success_time || new Date().toISOString();
-    const update = orderStore.updateOrder(order.id, {
-      status: "paid_pending_recharge",
-      transactionId,
-      userId: payer.id,
-      payerOpenid: payerOpenid || order.payerOpenid,
-      paidAt,
-      paymentSummary: { transactionId, amountFen: Number(payment.amount?.total), tradeState: payment.trade_state },
-      retryCount: Number(order.retryCount || 0),
-      nextRetryAt: new Date().toISOString(),
-      statusUpdatedAt: paidAt,
-      updatedAt: new Date().toISOString()
-    }, { expectedStatuses: ["pending_payment", "payment_pending"] });
-    if (!update.updated) {
-      if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review", "refunded"].includes(update.order?.status)) {
+    if (!accepted.update.updated) {
+      if (PAYMENT_ALREADY_ACCEPTED_STATUSES.has(accepted.update.order?.status)) {
         return json(res, 200, { code: "SUCCESS", message: "成功" });
       }
       return json(res, 409, { code: "FAIL", message: "订单状态冲突，请稍后重试" });

@@ -39,6 +39,16 @@ function openErApiPayload(overrides = {}) {
   };
 }
 
+function coinbasePayload(overrides = {}) {
+  return {
+    data: {
+      currency: "CNY",
+      rates: { IDR: "2631.125" },
+      ...overrides
+    }
+  };
+}
+
 test("selects the keyed provider without exposing the key in configuration", () => {
   const config = selectFxProvider({ EXCHANGE_RATE_API_KEY: "super-secret-key" });
   assert.deepEqual(config, {
@@ -50,12 +60,38 @@ test("selects the keyed provider without exposing the key in configuration", () 
   assert.doesNotMatch(JSON.stringify(config), /super-secret-key/);
 });
 
-test("falls back to the existing daily open.er-api feed when no key is configured", () => {
+test("selects Coinbase current snapshots when no key is configured", () => {
   assert.deepEqual(selectFxProvider({}), {
-    provider: FX_PROVIDERS.OPEN_ER_API,
-    source: "open.er-api /v6/latest/CNY (daily fallback)",
-    recommendedRefreshMinutes: 480,
-    degraded: true
+    provider: FX_PROVIDERS.COINBASE,
+    source: "Coinbase current snapshot",
+    recommendedRefreshMinutes: 60,
+    degraded: false
+  });
+});
+
+test("fetches and normalizes a keyless Coinbase current snapshot", async () => {
+  const calls = [];
+  const quote = await fetchFxQuote({
+    env: { COINBASE_REFRESH_MINUTES: "15" },
+    now,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return response(coinbasePayload());
+    }
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.coinbase.com/v2/exchange-rates?currency=CNY");
+  assert.deepEqual(calls[0].options.headers, { Accept: "application/json" });
+  assert.deepEqual(quote, {
+    idrPerCny: 2631.125,
+    provider: FX_PROVIDERS.COINBASE,
+    source: "Coinbase current snapshot",
+    providerUpdatedAt: "2026-08-23T04:00:00.000Z",
+    providerNextUpdateAt: null,
+    fetchedAt: "2026-08-23T04:00:00.000Z",
+    recommendedRefreshMinutes: 15,
+    degraded: false
   });
 });
 
@@ -93,7 +129,7 @@ test("fetches and normalizes a keyed ExchangeRate-API quote", async () => {
 test("fetches and normalizes the open.er-api fallback format", async () => {
   const calls = [];
   const quote = await fetchFxQuote({
-    env: {},
+    env: { FX_PROVIDER: "open-er-api" },
     now,
     fetchImpl: async (url) => {
       calls.push(url);
@@ -113,6 +149,13 @@ test("allows an operator to explicitly select the fallback despite having a key"
     FX_PROVIDER: "open-er-api",
     EXCHANGE_RATE_API_KEY: "unused-key"
   }).provider, FX_PROVIDERS.OPEN_ER_API);
+});
+
+test("allows an operator to select Coinbase explicitly despite having a keyed provider", () => {
+  assert.equal(selectFxProvider({
+    FX_PROVIDER: "coinbase",
+    EXCHANGE_RATE_API_KEY: "unused-key"
+  }).provider, FX_PROVIDERS.COINBASE);
 });
 
 test("requires a key when the keyed provider is selected explicitly", () => {
@@ -138,6 +181,27 @@ test("strictly rejects unsuccessful, wrong-base, invalid-rate and invalid-time p
         env: {}
       }),
       (error) => error instanceof FxProviderError && /^FX_(PARSE_ERROR|PROVIDER_REJECTED)$/.test(error.code)
+    );
+  }
+});
+
+test("strictly rejects malformed Coinbase snapshots", () => {
+  const cases = [
+    null,
+    {},
+    coinbasePayload({ currency: "USD" }),
+    coinbasePayload({ rates: null }),
+    coinbasePayload({ rates: { IDR: 2631.25 } }),
+    coinbasePayload({ rates: { IDR: "not-a-number" } })
+  ];
+  for (const payload of cases) {
+    assert.throws(
+      () => parseFxQuote(payload, {
+        provider: FX_PROVIDERS.COINBASE,
+        now,
+        env: {}
+      }),
+      (error) => error instanceof FxProviderError && error.code === "FX_PARSE_ERROR"
     );
   }
 });
@@ -188,6 +252,17 @@ test("rejects non-HTTPS endpoint overrides", async () => {
   );
 });
 
+test("rejects non-HTTPS Coinbase endpoint overrides", async () => {
+  await assert.rejects(
+    fetchFxQuote({
+      env: { COINBASE_EXCHANGE_RATE_URL: "http://rates.example.test/v2/exchange-rates" },
+      now,
+      fetchImpl: async () => response(coinbasePayload())
+    }),
+    (error) => error instanceof FxProviderError && error.code === "FX_CONFIG_ERROR"
+  );
+});
+
 test("exposes bounded provider-specific refresh recommendations", () => {
   assert.equal(recommendedFxRefreshMinutes(FX_PROVIDERS.EXCHANGE_RATE_API, {
     env: { EXCHANGE_RATE_API_REFRESH_MINUTES: "5" }
@@ -195,4 +270,10 @@ test("exposes bounded provider-specific refresh recommendations", () => {
   assert.equal(recommendedFxRefreshMinutes(FX_PROVIDERS.OPEN_ER_API, {
     env: { OPEN_ER_API_REFRESH_MINUTES: "15" }
   }), 480);
+  assert.equal(recommendedFxRefreshMinutes(FX_PROVIDERS.COINBASE, {
+    env: { COINBASE_REFRESH_MINUTES: "5" }
+  }), 5);
+  assert.equal(recommendedFxRefreshMinutes(FX_PROVIDERS.COINBASE, {
+    env: { COINBASE_REFRESH_MINUTES: "4" }
+  }), 60);
 });

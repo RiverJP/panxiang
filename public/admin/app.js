@@ -92,8 +92,17 @@ function updatePricingDraftHelp() {
 
 function formatFxSource(source) {
   if (source === "manual") return "后台手动设置";
+  if (String(source || "").toLowerCase().includes("coinbase")) return "Coinbase 当前汇率快照";
   if (String(source || "").includes("open.er-api.com")) return "ExchangeRate-API 免费行情";
   return source || "—";
+}
+
+function formatRefreshInterval(minutes) {
+  const value = Number(minutes);
+  if (!Number.isFinite(value) || value <= 0) return "1 小时";
+  if (value < 60) return `${Math.round(value)} 分钟`;
+  if (value % 60 === 0) return `${value / 60} 小时`;
+  return `${(value / 60).toFixed(1)} 小时`;
 }
 
 function fxHealthPresentation(fx) {
@@ -138,13 +147,15 @@ function renderFxState(fx) {
   $("#fxUpdated").textContent = formatDate(activityTime);
   const refreshPolicy = $("#fxRefreshPolicy");
   if (refreshPolicy) {
+    const refreshMinutes = Number(state.fx?.recommendedRefreshMinutes) || 60;
+    const refreshInterval = formatRefreshInterval(refreshMinutes);
     const activityTimestamp = Date.parse(activityTime || "");
     const nextAutomaticAt = isManual && Number.isFinite(activityTimestamp)
-      ? new Date(activityTimestamp + 8 * 60 * 60 * 1000).toISOString()
+      ? new Date(activityTimestamp + refreshMinutes * 60 * 1000).toISOString()
       : null;
     refreshPolicy.textContent = isManual
       ? `手动值临时生效；预计 ${formatDate(nextAutomaticAt)} 后由在线报价覆盖，也可立即点“刷新汇率”`
-      : "正常每 8 小时；异常 30 分钟重试";
+      : `正常每 ${refreshInterval}；异常按恢复策略重试`;
   }
 
   const rule = pricingRuleFromFx(state.fx);
@@ -1057,7 +1068,8 @@ function renderOrders() {
   });
   $("#orderResultCount").textContent = `${orders.length.toLocaleString("zh-CN")} 个订单`;
   $("#orderRows").innerHTML = orders.length ? orders.map((order) => {
-    const canRetry = ["paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status);
+    const canRetry = ["payment_pending", "paid_pending_recharge", "recharge_processing", "manual_review"].includes(order.status);
+    const retryLabel = order.status === "payment_pending" ? "查支付/补处理" : "重新提交/查单";
     return `<tr>
     <td><div class="order-id">${escapeHtml(order.id)}</div><div class="subline">${escapeHtml(order.detectedOperator || "")}</div></td>
     <td>${escapeHtml(order.phone || "—")}</td>
@@ -1066,14 +1078,18 @@ function renderOrders() {
     <td><span class="order-status ${orderStatusClass(order.status)}">${escapeHtml(orderLabels[order.status] || order.status || "未知")}</span>${order.provider?.data?.data?.order?.order_id ? `<div class="subline">ReloadN: ${escapeHtml(order.provider.data.data.order.order_id)}</div>` : ""}</td>
     <td>${escapeHtml(formatDate(order.createdAt))}</td>
     <td>${escapeHtml(formatDate(order.statusUpdatedAt || order.updatedAt || order.createdAt))}</td>
-    <td>${canRetry ? `<button class="mini-button retry-order" data-order-id="${escapeHtml(order.id)}">重新提交/查单</button>` : "—"}</td>
+    <td>${canRetry ? `<button class="mini-button retry-order" data-order-id="${escapeHtml(order.id)}" data-order-status="${escapeHtml(order.status)}">${retryLabel}</button>` : "—"}</td>
   </tr>`;
   }).join("") : '<tr><td colspan="8" class="empty-state">暂无符合条件的订单</td></tr>';
 }
 
 async function retryOrder(button) {
   const orderId = button.dataset.orderId;
-  if (!orderId || !window.confirm(`确定重新提交或查询订单 ${orderId} 吗？请先核对供应商后台，避免错误操作。`)) return;
+  const paymentPending = button.dataset.orderStatus === "payment_pending";
+  const prompt = paymentPending
+    ? `确定查询订单 ${orderId} 的微信支付结果吗？系统仅在微信确认付款成功后才会向 ReloadN 幂等补提或查单。`
+    : `确定重新提交或查询订单 ${orderId} 吗？请先核对供应商后台，避免错误操作。`;
+  if (!orderId || !window.confirm(prompt)) return;
   setButtonBusy(button, true, "处理中…");
   try {
     const result = await api(`/api/admin/orders/${encodeURIComponent(orderId)}/retry`, { method: "POST", body: "{}" });
