@@ -10,6 +10,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check src/provider.js && node --check src/wechat.js && node --check src/order-store.js && node --check src/catalog-pricing.js && node --check src/catalog-display.js && node --check public/app.js && node --check public/admin/app.js && node --test"
+    "check": "node --check server.js && node --check src/provider.js && node --check src/wechat.js && node --check src/order-store.js && node --check src/catalog-pricing.js && node --check src/catalog-display.js && node --check src/public-config.js && node --check public/app.js && node --check public/admin/app.js && node --test"
   }
 }

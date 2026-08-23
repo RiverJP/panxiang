@@ -34,7 +34,7 @@ const statusMeta = {
   manual_review: ["人工处理中", "客服正在核查本订单", "progress"]
 };
 const terminalStatuses = new Set(["recharge_success", "refunded"]);
-const state = { products: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null };
+const state = { products: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null, customerServiceUrl: "", publicConfigLoaded: false };
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -385,8 +385,23 @@ function showInfo(title, html) {
   openSheet(els.infoSheet);
 }
 
-function showSupport(service = "服务咨询") {
-  showInfo(service, `<h3>如何联系客服</h3><p>请关闭网页回到“盼享通”服务号，在对话框发送关键词 <strong>客服</strong>，并说明需要咨询的业务。</p><h3>温馨提示</h3><p>办理条件、费用、周期及所需材料以客服最终确认为准。请勿向非官方联系人提供敏感信息。</p>`);
+async function loadPublicConfig() {
+  if (state.publicConfigLoaded) return;
+  try {
+    const config = await fetchJson("/api/public-config");
+    state.customerServiceUrl = String(config.customerServiceUrl || "");
+    state.publicConfigLoaded = true;
+  } catch {
+    state.customerServiceUrl = "";
+  }
+}
+
+async function showSupport(service = "服务咨询") {
+  await loadPublicConfig();
+  const contactAction = state.customerServiceUrl
+    ? `<a class="support-action" href="${escapeHtml(state.customerServiceUrl)}">打开企业微信客服</a><p class="support-fallback">如果没有自动打开，请返回“盼享通”服务号，在对话框发送关键词 <strong>客服</strong>。</p>`
+    : '<p>请关闭网页回到“盼享通”服务号，在对话框发送关键词 <strong>客服</strong>，并说明需要咨询的业务。</p>';
+  showInfo(service, `<h3>联系客服</h3>${contactAction}<h3>温馨提示</h3><p>办理条件、费用、周期及所需材料以客服最终确认为准，请勿提供支付密码、短信验证码等敏感信息。</p>`);
 }
 
 async function updateIdentity() {
@@ -426,7 +441,7 @@ document.addEventListener("click", (event) => {
   if (supportButton) showSupport(supportButton.dataset.support);
   const infoButton = event.target.closest("[data-info]");
   if (infoButton?.dataset.info === "guide") showInfo("充值须知", "<h3>核对手机号</h3><p>提交前请确认号码和运营商正确，充值成功后通常无法撤回。</p><h3>到账时间</h3><p>支付成功不等于充值完成，请以订单详情中的最终状态为准。</p><h3>失败与退款</h3><p>未成功受理的订单将按系统状态进入退款或人工核查流程。</p>");
-  if (infoButton?.dataset.info === "about") showInfo("关于盼享随充", "<p>盼享随充为在印度尼西亚生活或旅行的用户提供通信充值及生活服务咨询。</p><p>本站并非印尼运营商官方账号，商品库存和到账结果以供应商及运营商处理为准。</p>");
+  if (infoButton?.dataset.info === "about") showInfo("关于盼享随充", "<p>盼享随充为在印度尼西亚生活或旅行的用户提供通信充值及生活服务咨询。</p><p>商品库存和到账结果以供应商及运营商处理结果为准。</p>");
 });
 
 els.kindFilters.addEventListener("click", (event) => { const button = event.target.closest("[data-kind]"); if (!button) return; state.kind = button.dataset.kind; state.visibleLimit = pageSize; renderProducts(); });
@@ -450,4 +465,5 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape") { 
 const initialUrl = new URL(location.href);
 renderRoute(initialUrl.searchParams.get("view") || "recharge", initialUrl.searchParams.get("id"));
 loadCatalog();
+loadPublicConfig();
 ensureWechatSession();
