@@ -112,7 +112,7 @@ test("calculates automatic CNY price from a current IDR/CNY rate", () => {
     { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
   );
   assert.equal(state.status, "ready");
-  assert.equal(state.priceCny, 1.05);
+  assert.equal(state.priceCny, 1.14);
 });
 
 test("reports the precise reason when the supplier buy price is missing", () => {

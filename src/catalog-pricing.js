@@ -119,7 +119,7 @@ export function autoPriceState(product, fx, {
   if (!Number.isFinite(fxAge) || fxAge < 0 || fxAge > maxFxAgeHours * 60 * 60 * 1000) {
     return { status: "stale_fx", reason: "汇率已过期，请刷新", priceCny: null };
   }
-  const calculated = Number(((buyPriceIdr - 120) / idrPerCny).toFixed(2));
+  const calculated = Number(((buyPriceIdr + 120) / idrPerCny).toFixed(2));
   if (!Number.isFinite(calculated) || calculated <= 0) {
     return { status: "invalid_auto_price", reason: "自动售价计算结果无效", priceCny: null };
   }
