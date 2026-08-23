@@ -31,13 +31,13 @@ const envFile = path.join(root, ".env");
 if (existsSync(envFile)) process.loadEnvFile(envFile);
 const publicDir = path.join(root, "public");
 const port = Number(process.env.PORT || 3000);
-const wechatStates = new Map();
-const wechatSessions = new Map();
 const adminSessions = new Map();
 const adminCaptchas = new Map();
 const adminLoginAttempts = new Map();
 const adminCaptchaRequests = new Map();
 const adminCookieName = "__Host-px_admin_session";
+const wechatCookieName = "px_wechat_session";
+const wechatSessionTtlSeconds = Math.min(180 * 24 * 60 * 60, Math.max(60 * 60, Number(process.env.WECHAT_SESSION_TTL_SECONDS) || 30 * 24 * 60 * 60));
 const dataDir = path.join(root, "data");
 const productsFile = path.join(dataDir, "products.json");
 const fxFile = path.join(dataDir, "fx.json");
@@ -95,6 +95,49 @@ function parseCookies(req) {
     try { return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))]; }
     catch { return [part.slice(0, index), ""]; }
   }));
+}
+
+function safeReturnPath(value) {
+  const candidate = String(value || "/").trim();
+  if (!candidate.startsWith("/") || candidate.startsWith("//") || candidate.includes("\\") || /[\r\n]/.test(candidate)) return "/";
+  try {
+    const parsed = new URL(candidate, "https://reloadb.invalid");
+    if (parsed.origin !== "https://reloadb.invalid") return "/";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return "/";
+  }
+}
+
+function getWechatIdentity(req, options = {}) {
+  try {
+    const token = parseCookies(req)[wechatCookieName];
+    if (!token) return null;
+    const session = orderStore.getWechatSession(token, { touch: options.touch !== false });
+    return session?.user ? { token, session, user: session.user } : null;
+  } catch {
+    // Cookies are untrusted input. A malformed/oversized cookie is simply not an authenticated session.
+    return null;
+  }
+}
+
+function requireWechatIdentity(req, res) {
+  const identity = getWechatIdentity(req);
+  if (!identity) {
+    json(res, 401, { ok: false, code: "WECHAT_AUTH_REQUIRED", message: "请在微信服务号内重新打开页面完成授权" });
+    return null;
+  }
+  return identity;
+}
+
+function publicWechatUser(user) {
+  return user ? { id: user.id, hasUnionId: Boolean(user.unionid) } : null;
+}
+
+function orderOwnedByIdentity(order, identity) {
+  if (!order || !identity?.user) return false;
+  if (order.userId) return safeEqualText(order.userId, identity.user.id);
+  return Boolean(order.payerOpenid && safeEqualText(order.payerOpenid, identity.user.openid));
 }
 
 function safeEqualText(left, right) {
@@ -960,17 +1003,40 @@ async function handleApi(req, res, url) {
     const allowDemo = process.env.NODE_ENV !== "production" && managed.length === 0;
     return json(res, 200, { ok: true, currency: "CNY", products: allowDemo ? catalog : published });
   }
+  if (req.method === "GET" && url.pathname === "/api/me") {
+    const identity = requireWechatIdentity(req, res);
+    if (!identity) return;
+    return json(res, 200, { ok: true, authenticated: true, user: publicWechatUser(identity.user) });
+  }
+  if (req.method === "GET" && url.pathname === "/api/me/orders") {
+    const identity = requireWechatIdentity(req, res);
+    if (!identity) return;
+    const requestedLimit = Number(url.searchParams.get("limit"));
+    const requestedOffset = Number(url.searchParams.get("offset"));
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(100, requestedLimit) : 50;
+    const offset = Number.isSafeInteger(requestedOffset) && requestedOffset >= 0 ? Math.min(1_000_000_000, requestedOffset) : 0;
+    const orders = orderStore.listOrders({ userId: identity.user.id, limit, offset }).map(publicOrder);
+    return json(res, 200, { ok: true, orders, limit, offset, nextOffset: orders.length === limit ? offset + limit : null });
+  }
   if (req.method === "GET" && url.pathname.startsWith("/api/orders/")) {
-    const order = orderStore.getOrder(url.pathname.split("/").pop());
+    const orderId = String(url.pathname.split("/").pop() || "").trim();
+    if (!orderId || orderId.length > 128) return json(res, 404, { ok: false, message: "订单不存在" });
+    let order = orderStore.getOrder(orderId);
     if (!order) return json(res, 404, { ok: false, message: "订单不存在" });
     const token = String(url.searchParams.get("token") || "");
-    const cookie = String(req.headers.cookie || "").split(";").map((value) => value.trim()).find((value) => value.startsWith("px_wechat_session="));
-    const sessionId = cookie?.slice("px_wechat_session=".length);
-    const openid = wechatSessions.get(sessionId)?.openid;
-    const ownsOrder = (token && safeEqualText(token, order.lookupToken)) || (openid && safeEqualText(openid, order.payerOpenid));
+    const identity = getWechatIdentity(req);
+    const legacyTokenMatches = !order.userId && token && order.lookupToken && safeEqualText(token, order.lookupToken);
+    const mayClaimLegacy = identity && (orderOwnedByIdentity(order, identity) || (!order.payerOpenid && legacyTokenMatches));
+    if (!order.userId && mayClaimLegacy) {
+      const linked = orderStore.updateOrder(order.id, { userId: identity.user.id, payerOpenid: order.payerOpenid || identity.user.openid });
+      if (linked.updated) order = linked.order;
+    }
+    const ownsOrder = orderOwnedByIdentity(order, identity) || (!order.userId && legacyTokenMatches);
     return ownsOrder ? json(res, 200, { ok: true, order: publicOrder(order) }) : json(res, 403, { ok: false, message: "无权查看该订单" });
   }
   if (req.method === "POST" && url.pathname === "/api/orders") {
+    const identity = requireWechatIdentity(req, res);
+    if (!identity) return;
     let input;
     try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
     const managed = await readJson(productsFile, []);
@@ -986,7 +1052,7 @@ async function handleApi(req, res, url) {
     if (detectedOperator && detectedOperator !== product.operator) return json(res, 400, { ok: false, message: `该手机号段识别为 ${detectedOperator}，请选择对应套餐` });
     const id = `PX${Date.now()}${crypto.randomBytes(3).toString("hex")}`;
     const lookupToken = crypto.randomBytes(24).toString("base64url");
-    const order = { id, lookupToken, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt: new Date().toISOString() };
+    const order = { id, lookupToken, userId: identity.user.id, payerOpenid: identity.user.openid, phone: `+62${phone.slice(1)}`, detectedOperator, productId: product.id, productLabel: product.label, price: product.price, currency: product.currency, status: "created", createdAt: new Date().toISOString() };
     // 供应商下单必须在微信支付成功后执行，避免用户未付款却触发真实充值。
     order.status = "pending_payment";
     const created = orderStore.createOrder(order);
@@ -995,42 +1061,53 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/wechat/oauth/start") {
     if (!process.env.WECHAT_APPID || !process.env.WECHAT_APP_SECRET) return json(res, 503, { ok: false, message: "微信 AppID 或 AppSecret 未配置" });
     const state = crypto.randomBytes(18).toString("hex");
-    const returnPath = String(url.searchParams.get("return") || "/").startsWith("/") ? String(url.searchParams.get("return") || "/") : "/";
-    wechatStates.set(state, { returnPath, expiresAt: Date.now() + 5 * 60 * 1000 });
+    const returnPath = safeReturnPath(url.searchParams.get("return"));
+    orderStore.cleanupWechatAuth();
+    orderStore.createWechatOauthState(state, returnPath, new Date(Date.now() + 5 * 60 * 1000).toISOString());
     const redirect = `${process.env.PUBLIC_BASE_URL || "https://reloadb.com"}/api/wechat/oauth/callback`;
     const oauth = `https://open.weixin.qq.com/connect/oauth2/authorize?appid=${encodeURIComponent(process.env.WECHAT_APPID)}&redirect_uri=${encodeURIComponent(redirect)}&response_type=code&scope=snsapi_base&state=${state}#wechat_redirect`;
     res.writeHead(302, { location: oauth }); res.end(); return;
   }
   if (req.method === "GET" && url.pathname === "/api/wechat/oauth/callback") {
-    const state = wechatStates.get(String(url.searchParams.get("state") || ""));
-    if (!state || state.expiresAt < Date.now()) return json(res, 400, { ok: false, message: "授权状态已失效" });
-    wechatStates.delete(String(url.searchParams.get("state") || ""));
+    let state = null;
+    try { state = orderStore.consumeWechatOauthState(String(url.searchParams.get("state") || "")); } catch {}
+    if (!state) return json(res, 400, { ok: false, message: "授权状态已失效" });
     const code = String(url.searchParams.get("code") || "");
+    if (!code) return json(res, 400, { ok: false, message: "微信授权未返回 code" });
     const tokenResponse = await fetch(`https://api.weixin.qq.com/sns/oauth2/access_token?appid=${encodeURIComponent(process.env.WECHAT_APPID)}&secret=${encodeURIComponent(process.env.WECHAT_APP_SECRET)}&code=${encodeURIComponent(code)}&grant_type=authorization_code`);
     const token = await tokenResponse.json();
     if (!token.openid) return json(res, 502, { ok: false, message: "微信授权失败" });
-    const session = crypto.randomBytes(24).toString("hex");
-    wechatSessions.set(session, { openid: token.openid, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
-    res.writeHead(302, { location: state.returnPath, "set-cookie": `px_wechat_session=${session}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax` }); res.end(); return;
+    const user = orderStore.upsertWechatUser({ appid: process.env.WECHAT_APPID, openid: token.openid, unionid: token.unionid });
+    const session = crypto.randomBytes(32).toString("base64url");
+    orderStore.createWechatSession(session, user.id, new Date(Date.now() + wechatSessionTtlSeconds * 1000).toISOString());
+    res.writeHead(302, { location: state.returnPath, "set-cookie": `${wechatCookieName}=${session}; Path=/; Max-Age=${wechatSessionTtlSeconds}; HttpOnly; Secure; SameSite=Lax` }); res.end(); return;
   }
   if (req.method === "GET" && url.pathname === "/api/wechat/session") {
-    const cookie = String(req.headers.cookie || "").split(";").map((v) => v.trim()).find((v) => v.startsWith("px_wechat_session="));
-    const session = cookie?.slice("px_wechat_session=".length);
-    const value = wechatSessions.get(session);
-    return json(res, 200, { ok: true, authorized: Boolean(value && value.expiresAt > Date.now()) });
+    const identity = getWechatIdentity(req);
+    return json(res, 200, { ok: true, authorized: Boolean(identity), user: publicWechatUser(identity?.user) });
   }
   if (req.method === "POST" && url.pathname === "/api/wechat/prepay") {
     let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
-    const order = orderStore.getOrder(String(input.orderId || ""));
-    if (!order || order.status !== "pending_payment") return json(res, 400, { ok: false, message: "订单不存在或状态不允许支付" });
-    const cookie = String(req.headers.cookie || "").split(";").map((v) => v.trim()).find((v) => v.startsWith("px_wechat_session="));
-    const session = cookie?.slice("px_wechat_session=".length);
-    const openid = String(input.openid || wechatSessions.get(session)?.openid || "");
-    if (!openid) return json(res, 400, { ok: false, message: "缺少微信用户OpenID，请在服务号网页内打开" });
+    const identity = requireWechatIdentity(req, res);
+    if (!identity) return;
+    const orderId = String(input.orderId || "").trim();
+    if (!orderId || orderId.length > 128) return json(res, 400, { ok: false, message: "订单不存在或状态不允许支付" });
+    let order = orderStore.getOrder(orderId);
+    if (!order || !["pending_payment", "payment_pending"].includes(order.status)) return json(res, 400, { ok: false, message: "订单不存在或状态不允许支付" });
+    if (!orderOwnedByIdentity(order, identity)) return json(res, 403, { ok: false, message: "无权支付该订单" });
+    if (!order.userId) {
+      const linked = orderStore.updateOrder(order.id, { userId: identity.user.id });
+      if (!linked.updated) return json(res, 409, { ok: false, message: "订单归属更新失败，请刷新后重试" });
+      order = linked.order;
+    }
+    const openid = identity.user.openid;
     const amountFen = Math.round(Number(order.price) * 100);
     if (!Number.isFinite(amountFen) || amountFen <= 0) return json(res, 400, { ok: false, message: "订单金额无效" });
+    if (order.status === "payment_pending" && order.prepayId) {
+      return json(res, 200, { ok: true, orderId: order.id, payment: await buildJsapiPayParams(order.prepayId), replay: true });
+    }
     const data = await createJsapiPrepay({ description: order.productLabel.slice(0, 120), outTradeNo: order.id, amountFen, openid });
-    const update = orderStore.updateOrder(order.id, { status: "payment_pending", prepayId: data.prepay_id, payerOpenid: openid, updatedAt: new Date().toISOString() }, { expectedStatuses: "pending_payment" });
+    const update = orderStore.updateOrder(order.id, { status: "payment_pending", prepayId: data.prepay_id, payerOpenid: openid, userId: identity.user.id, updatedAt: new Date().toISOString() }, { expectedStatuses: ["pending_payment", "payment_pending"] });
     if (!update.updated) {
       const current = update.order;
       if (current?.status === "payment_pending" && current.prepayId) {
@@ -1047,19 +1124,24 @@ async function handleApi(req, res, url) {
     if (!order) return json(res, 500, { code: "FAIL", message: "本地订单不存在，请稍后重试" });
     const expectedFen = Math.round(Number(order.price) * 100);
     const payerOpenid = String(payment.payer?.openid || "");
+    const owner = order.userId ? orderStore.getWechatUser(order.userId) : null;
     const identityMatches = safeEqualText(payment.appid, process.env.WECHAT_APPID)
       && safeEqualText(payment.mchid, process.env.WECHAT_MCHID)
       && safeEqualText(payment.amount?.currency, "CNY")
-      && (!order.payerOpenid || safeEqualText(payerOpenid, order.payerOpenid));
+      && Boolean(payerOpenid)
+      && (!order.payerOpenid || safeEqualText(payerOpenid, order.payerOpenid))
+      && (!owner || (safeEqualText(owner.appid, payment.appid) && safeEqualText(owner.openid, payerOpenid)));
     if (!identityMatches || payment.trade_state !== "SUCCESS" || Number(payment.amount?.total) !== expectedFen) {
       return json(res, 400, { code: "FAIL", message: "支付身份、状态或金额不匹配" });
     }
-    if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review"].includes(order.status)) return json(res, 200, { code: "SUCCESS", message: "成功" });
+    if (["paid_pending_recharge", "recharge_processing", "recharge_success", "refund_required", "manual_review", "refunded"].includes(order.status)) return json(res, 200, { code: "SUCCESS", message: "成功" });
     const transactionId = String(payment.transaction_id || "");
     if (!transactionId) return json(res, 400, { code: "FAIL", message: "微信支付流水号缺失" });
+    const payer = owner || orderStore.upsertWechatUser({ appid: payment.appid, openid: payerOpenid });
     const update = orderStore.updateOrder(order.id, {
       status: "paid_pending_recharge",
       transactionId,
+      userId: payer.id,
       payerOpenid: payerOpenid || order.payerOpenid,
       paidAt: payment.success_time || new Date().toISOString(),
       paymentSummary: { transactionId, amountFen: Number(payment.amount?.total), tradeState: payment.trade_state },
@@ -1089,7 +1171,10 @@ async function handleApi(req, res, url) {
     if (eventType === "test.ping") return json(res, 200, { ok: true, ping: true });
     const status = eventType === "order.success" ? "recharge_success"
       : eventType === "order.failed" ? "refund_required"
-      : eventType === "order.refunded" ? "refunded"
+      // ReloadN refunded only confirms that the supplier-side balance was
+      // returned. It does not prove that the customer's WeChat payment has
+      // been refunded, so keep the order in the manual-refund queue.
+      : eventType === "order.refunded" ? "refund_required"
       : null;
     const result = orderStore.applyProviderWebhook({
       webhookId,
@@ -1165,6 +1250,11 @@ async function scheduledMaintenance() {
   maintenanceRunning = true;
   const now = Date.now();
   try {
+    try {
+      orderStore.cleanupWechatAuth();
+    } catch (error) {
+      console.error("Wechat auth cleanup failed:", error.message);
+    }
     try {
       const fx = await readJson(fxFile, null);
       const fxAge = now - Date.parse(fx?.updatedAt || 0);

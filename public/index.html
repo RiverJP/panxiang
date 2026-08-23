@@ -3,62 +3,105 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#fffaf7">
   <title>盼享随充｜印尼话费与流量充值</title>
-  <meta name="description" content="为在印度尼西亚生活和旅行的华人提供话费、流量套餐充值服务。">
+  <meta name="description" content="印尼话费、流量套餐充值与本地生活服务。">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header class="topbar"><div class="brand"><span class="brand-mark">P</span><span>盼享随充</span></div><span class="status">印尼通信充值</span></header>
-  <main>
-    <section class="hero">
-      <div class="eyebrow">PANXIANG · INDONESIA</div>
-      <h1>在印尼，充值更简单</h1>
-      <p>话费、流量套餐，服务在印尼长期生活的华人。套餐到账时间以运营商和供应商处理结果为准。</p>
-      <div class="trust-row"><span>✓ 线上下单</span><span>✓ 订单可查</span><span>✓ 中文客服</span></div>
-    </section>
-    <section class="panel" aria-labelledby="recharge-title">
-      <div class="panel-heading"><div><span class="eyebrow">QUICK RECHARGE</span><h2 id="recharge-title">选择充值套餐</h2></div><span class="pill">服务号内支付</span></div>
-      <div class="catalog-tools" aria-label="套餐筛选">
-        <div class="filter-group">
-          <span class="filter-label">套餐类型</span>
-          <div id="kind-filters" class="filter-chips" role="group" aria-label="按套餐类型筛选">
-            <button type="button" class="filter-chip active" data-kind="all" aria-pressed="true">全部</button>
-            <button type="button" class="filter-chip" data-kind="topup" aria-pressed="false">话费</button>
-            <button type="button" class="filter-chip" data-kind="data" aria-pressed="false">流量</button>
+  <header class="app-header">
+    <button class="brand" type="button" data-route="recharge" aria-label="回到充值首页"><span class="brand-mark">P</span><span><strong>盼享随充</strong><small>印尼通信充值</small></span></button>
+    <button class="header-link" type="button" data-route="orders">订单记录</button>
+  </header>
+
+  <main class="app-main">
+    <section class="app-view" id="view-recharge" data-view="recharge">
+      <div class="welcome-card">
+        <p class="eyebrow">PANXIANG · INDONESIA</p>
+        <h1>印尼充值，三步完成</h1>
+        <p>输入手机号，系统自动匹配运营商和可用套餐。</p>
+        <div class="trust-row"><span>安全支付</span><span>状态可查</span><span>中文客服</span></div>
+      </div>
+
+      <form id="order-form" novalidate>
+        <section class="flow-card phone-card">
+          <div class="step-heading"><span>1</span><div><h2>输入印尼手机号</h2><p>支持 08、62 或 +62 开头</p></div></div>
+          <div class="phone-field"><span>🇮🇩 +62</span><input id="phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" placeholder="812 3456 7890" aria-describedby="operator-hint"><button id="clear-phone" type="button" aria-label="清空手机号">×</button></div>
+          <p id="operator-hint" class="field-hint" aria-live="polite">输入完整号码后自动识别运营商</p>
+        </section>
+
+        <section class="flow-card package-card">
+          <div class="step-heading"><span>2</span><div><h2>选择充值套餐</h2><p id="package-subtitle">可先浏览，输入号码后将自动筛选</p></div></div>
+          <div id="operator-filters" class="filter-strip" aria-label="运营商筛选"></div>
+          <div id="kind-filters" class="segmented" aria-label="套餐类型">
+            <button type="button" class="active" data-kind="all" aria-pressed="true">全部</button>
+            <button type="button" data-kind="topup" aria-pressed="false">话费</button>
+            <button type="button" data-kind="data" aria-pressed="false">流量</button>
           </div>
-        </div>
-        <div class="filter-group">
-          <span class="filter-label">运营商</span>
-          <div id="operator-filters" class="filter-chips filter-chips--scroll" role="group" aria-label="按运营商筛选"></div>
-        </div>
-        <p id="catalog-summary" class="catalog-summary" aria-live="polite"></p>
-      </div>
-      <div id="products" class="products"><div class="loading">正在加载套餐…</div></div>
-      <button type="button" id="load-more" class="load-more" hidden>查看更多</button>
-      <form id="order-form" class="order-form">
-        <label>印尼手机号<input id="phone" name="phone" inputmode="tel" placeholder="例如 +62812xxxxxxx" autocomplete="tel" required><span id="operator-hint" class="operator-hint">输入号码后自动识别运营商</span></label>
-        <div class="form-foot"><div><span class="muted">应付金额</span><strong id="total">请选择套餐</strong></div><button type="submit" id="submit">创建订单</button></div>
-        <p class="notice">请仔细核对手机号。充值成功后通常无法撤回；充值失败将按订单状态处理。</p>
+          <p id="catalog-summary" class="catalog-summary" aria-live="polite"></p>
+          <div id="products" class="products"><div class="empty-state">正在加载套餐…</div></div>
+          <button id="load-more" class="load-more" type="button" hidden>查看更多套餐</button>
+        </section>
       </form>
-      <div id="message" class="message" role="status"></div>
+
+      <section class="assurance-card">
+        <div><b>✓</b><span><strong>微信安全支付</strong><small>服务号内直接完成付款</small></span></div>
+        <div><b>✓</b><span><strong>全程状态可查</strong><small>支付、充值、退款进度清晰可见</small></span></div>
+        <button type="button" data-route="services"><span><strong>还有其他印尼生活需求？</strong><small>查看手机解锁、签证、驾照协助</small></span><b>›</b></button>
+      </section>
     </section>
-    <section class="info-grid"><article><span class="icon">01</span><h3>先选运营商</h3><p>支持的运营商和套餐以页面实时展示为准。</p></article><article><span class="icon">02</span><h3>再填手机号</h3><p>请输入 +62 开头的完整号码，或 08 开头的印尼本地号码。</p></article><article><span class="icon">03</span><h3>订单可追踪</h3><p>支付和充值状态由系统及供应商回调更新。</p></article></section>
-    <section class="services-section" aria-labelledby="services-title">
-      <div class="section-heading">
-        <span class="eyebrow">MORE SERVICES</span>
-        <h2 id="services-title">更多印尼生活服务</h2>
-        <p>以下内容仅作服务展示，具体办理条件、周期和所需材料请联系公众号客服确认。</p>
-      </div>
-      <div class="service-grid">
-        <article class="service-card"><span class="service-no">01</span><h3>手机解锁协助</h3><p>提供手机网络锁、使用限制等相关问题的咨询与处理协助。</p><span class="service-tag">咨询协助</span></article>
-        <article class="service-card"><span class="service-no">02</span><h3>签证办理咨询</h3><p>提供签证类型、材料准备及常见办理流程咨询。</p><span class="service-tag">咨询服务</span></article>
-        <article class="service-card"><span class="service-no">03</span><h3>驾照办理协助</h3><p>提供办理要求、资料准备及相关流程协助。</p><span class="service-tag">办理协助</span></article>
-        <article class="service-card service-card--muted"><span class="service-no">04</span><h3>其他业务</h3><p>更多本地生活服务正在拓展中，敬请期待。</p><span class="service-tag">拓展中</span></article>
-      </div>
-      <div class="service-contact"><div><strong>需要了解详细信息？</strong><span>具体服务内容、费用和办理要求请联系公众号客服。</span></div><strong class="contact-hint">请在公众号回复“客服”</strong></div>
+
+    <section class="app-view" id="view-orders" data-view="orders" hidden>
+      <div class="page-title"><div><p class="eyebrow">MY ORDERS</p><h1>订单记录</h1><p>查看当前微信账号的充值订单及最新状态。</p></div><button id="refresh-orders" type="button">刷新</button></div>
+      <div id="orders-list" class="orders-list"><div class="empty-state">暂无订单记录</div></div>
+      <aside class="tip-card">订单已与当前微信账号关联。以后从“盼享通”服务号重新进入，仍可查询历史订单和最新处理进度。</aside>
     </section>
+
+    <section class="app-view" id="view-order" data-view="order" hidden>
+      <button id="order-back" class="back-button" type="button">‹ 返回订单</button>
+      <div id="order-detail" class="order-detail"><div class="empty-state">正在查询订单…</div></div>
+    </section>
+
+    <section class="app-view" id="view-services" data-view="services" hidden>
+      <div class="page-title"><div><p class="eyebrow">MORE SERVICES</p><h1>印尼生活服务</h1><p>具体条件、周期和所需材料请联系客服确认。</p></div></div>
+      <div class="service-list">
+        <button type="button" data-support="手机解锁协助"><span class="service-icon">01</span><span><strong>手机解锁协助</strong><small>网络锁、使用限制等问题咨询与处理协助</small></span><b>›</b></button>
+        <button type="button" data-support="签证办理咨询"><span class="service-icon">02</span><span><strong>签证办理咨询</strong><small>签证类型、材料准备及常见流程咨询</small></span><b>›</b></button>
+        <button type="button" data-support="驾照办理协助"><span class="service-icon">03</span><span><strong>驾照办理协助</strong><small>办理要求、资料准备及相关流程协助</small></span><b>›</b></button>
+        <button type="button" data-support="其他业务"><span class="service-icon muted">04</span><span><strong>其他业务</strong><small>更多本地生活服务正在拓展中</small></span><b>›</b></button>
+      </div>
+      <button id="show-help" class="primary-wide" type="button">联系公众号客服</button>
+    </section>
+
+    <section class="app-view" id="view-me" data-view="me" hidden>
+      <div class="profile-card"><span class="profile-avatar">盼</span><div><h1 id="identity-title">微信访客</h1><p id="identity-copy">正在确认服务号登录状态…</p></div><span id="identity-status" class="status-badge">检查中</span></div>
+      <div class="menu-card">
+        <button type="button" data-route="orders"><span><strong>我的订单</strong><small><i id="my-order-count">0</i> 笔充值订单</small></span><b>›</b></button>
+        <button type="button" data-route="services"><span><strong>更多服务</strong><small>印尼生活服务咨询</small></span><b>›</b></button>
+        <button type="button" data-info="guide"><span><strong>充值须知</strong><small>号码、到账与退款说明</small></span><b>›</b></button>
+        <button type="button" data-info="about"><span><strong>关于我们</strong><small>盼享随充服务说明</small></span><b>›</b></button>
+      </div>
+    </section>
+
+    <footer class="site-footer">盼享随充 · 非印尼运营商官方账号<br><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">蜀ICP备2026048561号</a></footer>
   </main>
-  <footer class="site-footer">盼享随充 · 为在印度尼西亚生活的华人提供便民服务<br><span>非印尼运营商官方账号，具体到账以订单状态为准</span><br><a class="icp-link" href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer">蜀ICP备2026048561号</a></footer>
+
+  <div id="checkout-bar" class="checkout-bar" aria-live="polite">
+    <div><small id="checkout-label">尚未选择套餐</small><strong id="total">¥0.00</strong></div>
+    <button id="checkout" type="button" disabled>下一步</button>
+  </div>
+
+  <nav class="bottom-nav" aria-label="主要导航">
+    <button type="button" class="active" data-route="recharge"><span>充</span><b>充值</b></button>
+    <button type="button" data-route="orders"><span>单</span><b>订单</b></button>
+    <button type="button" data-route="services"><span>服</span><b>服务</b></button>
+    <button type="button" data-route="me"><span>我</span><b>我的</b></button>
+  </nav>
+
+  <div id="confirm-sheet" class="sheet" hidden><button class="sheet-backdrop" type="button" data-close-sheet aria-label="关闭"></button><section role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div class="sheet-handle"></div><div class="sheet-title"><div><p class="eyebrow">CONFIRM ORDER</p><h2 id="confirm-title">确认充值信息</h2></div><button type="button" data-close-sheet aria-label="关闭">×</button></div><dl class="confirm-list"><div><dt>充值号码</dt><dd id="confirm-phone">—</dd></div><div><dt>运营商</dt><dd id="confirm-operator">—</dd></div><div><dt>充值套餐</dt><dd id="confirm-product">—</dd></div><div class="amount"><dt>实付金额</dt><dd id="confirm-price">—</dd></div></dl><p class="sheet-notice">请务必确认手机号正确。数字商品充值成功后通常无法撤回。</p><p id="payment-message" class="payment-message" role="status"></p><button id="confirm-pay" class="primary-wide" type="button">确认并微信支付</button></section></div>
+
+  <div id="info-sheet" class="sheet" hidden><button class="sheet-backdrop" type="button" data-close-info aria-label="关闭"></button><section role="dialog" aria-modal="true" aria-labelledby="info-title"><div class="sheet-handle"></div><div class="sheet-title"><h2 id="info-title">服务说明</h2><button type="button" data-close-info aria-label="关闭">×</button></div><div id="info-content" class="info-content"></div><button class="primary-wide" type="button" data-close-info>知道了</button></section></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/app.js" defer></script>
 </body>
 </html>

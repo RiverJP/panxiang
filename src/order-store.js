@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
@@ -71,6 +72,15 @@ function orderVersionOf(order) {
   return value;
 }
 
+function userIdOf(order) {
+  return nullableText(order?.userId ?? order?.user_id, 128);
+}
+
+function tokenHash(token, label) {
+  const value = requiredText(token, label, 512);
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function canonicalOrder(order, existing = null) {
   if (!order || typeof order !== "object" || Array.isArray(order)) throw new TypeError("订单必须是对象");
   const outTradeNo = outTradeNoOf(order);
@@ -89,12 +99,16 @@ function canonicalOrder(order, existing = null) {
   const transactionId = transactionIdOf(normalized);
   const providerOrderId = providerOrderIdOf(normalized);
   const orderVersion = orderVersionOf(normalized);
+  const userId = userIdOf(normalized);
+  delete normalized.user_id;
   if (transactionId) normalized.transactionId = transactionId;
   else delete normalized.transactionId;
   if (providerOrderId) normalized.providerOrderId = providerOrderId;
   else delete normalized.providerOrderId;
+  if (userId) normalized.userId = userId;
+  else delete normalized.userId;
   normalized.orderVersion = orderVersion;
-  return { outTradeNo, transactionId, providerOrderId, orderVersion, status, createdAt, updatedAt, order: normalized };
+  return { outTradeNo, transactionId, providerOrderId, userId, orderVersion, status, createdAt, updatedAt, order: normalized };
 }
 
 function rowToOrder(row) {
@@ -109,7 +123,41 @@ function rowToOrder(row) {
   else delete order.transactionId;
   if (row.provider_order_id) order.providerOrderId = row.provider_order_id;
   else delete order.providerOrderId;
+  if (row.user_id) order.userId = row.user_id;
+  else delete order.userId;
   return order;
+}
+
+function rowToWechatUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    appid: row.appid,
+    openid: row.openid,
+    unionid: row.unionid || null,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at
+  };
+}
+
+function rowToWechatSession(row) {
+  if (!row) return null;
+  return {
+    tokenHash: row.token_hash,
+    userId: row.user_id,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    revokedAt: row.revoked_at || null,
+    user: row.wx_openid ? {
+      id: row.wx_user_id,
+      appid: row.wx_appid,
+      openid: row.wx_openid,
+      unionid: row.wx_unionid || null,
+      createdAt: row.wx_created_at,
+      lastSeenAt: row.wx_last_seen_at
+    } : undefined
+  };
 }
 
 function rowToWebhook(row) {
@@ -150,20 +198,43 @@ export class OrderStore {
         updated_at TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS wechat_users (
+        id TEXT PRIMARY KEY,
+        appid TEXT NOT NULL,
+        openid TEXT NOT NULL,
+        unionid TEXT,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        UNIQUE(appid, openid)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS wechat_sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES wechat_users(id) ON DELETE CASCADE,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        revoked_at TEXT
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS wechat_oauth_states (
+        state_hash TEXT PRIMARY KEY,
+        return_path TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS orders (
         out_trade_no TEXT PRIMARY KEY,
         transaction_id TEXT UNIQUE,
         provider_order_id TEXT,
+        user_id TEXT REFERENCES wechat_users(id),
         status TEXT NOT NULL,
         order_version INTEGER NOT NULL DEFAULT 0 CHECK (order_version >= 0),
         data_json TEXT NOT NULL CHECK (json_valid(data_json)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS idx_orders_provider_order_id ON orders(provider_order_id);
-      CREATE INDEX IF NOT EXISTS idx_orders_status_created_at ON orders(status, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC);
 
       CREATE TABLE IF NOT EXISTS provider_webhooks (
         webhook_id TEXT PRIMARY KEY,
@@ -177,6 +248,20 @@ export class OrderStore {
         processed_at TEXT
       ) STRICT;
 
+    `);
+    const orderColumns = this.db.prepare("PRAGMA table_info(orders)").all();
+    if (!orderColumns.some((column) => column.name === "user_id")) {
+      this.db.exec("ALTER TABLE orders ADD COLUMN user_id TEXT REFERENCES wechat_users(id)");
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_wechat_users_unionid ON wechat_users(unionid);
+      CREATE INDEX IF NOT EXISTS idx_wechat_sessions_user ON wechat_sessions(user_id, expires_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_wechat_sessions_expiry ON wechat_sessions(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_wechat_oauth_states_expiry ON wechat_oauth_states(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_orders_user_created_at ON orders(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_orders_provider_order_id ON orders(provider_order_id);
+      CREATE INDEX IF NOT EXISTS idx_orders_status_created_at ON orders(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_provider_webhooks_order ON provider_webhooks(out_trade_no);
       CREATE INDEX IF NOT EXISTS idx_provider_webhooks_provider_order ON provider_webhooks(provider_order_id);
       CREATE INDEX IF NOT EXISTS idx_provider_webhooks_received_at ON provider_webhooks(received_at DESC);
@@ -246,6 +331,120 @@ export class OrderStore {
     return this.getOrder(normalized.outTradeNo);
   }
 
+  upsertWechatUser(input) {
+    this.#assertInitialized();
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new TypeError("微信用户必须是对象");
+    const appid = requiredText(input.appid, "微信 AppID", 128);
+    const openid = requiredText(input.openid, "微信 OpenID", 128);
+    const unionid = nullableText(input.unionid, 128);
+    const seenAt = nullableText(input.lastSeenAt, 64) || nowIso();
+    const existing = this.getWechatUserByOpenid(appid, openid);
+    if (existing) {
+      this.db.prepare(`
+        UPDATE wechat_users
+        SET unionid = COALESCE(?, unionid), last_seen_at = ?
+        WHERE id = ?
+      `).run(unionid, seenAt, existing.id);
+      return this.getWechatUser(existing.id);
+    }
+    const id = nullableText(input.id, 128) || `wxu_${crypto.randomUUID().replaceAll("-", "")}`;
+    this.db.prepare(`
+      INSERT INTO wechat_users (id, appid, openid, unionid, created_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, appid, openid, unionid, seenAt, seenAt);
+    return this.getWechatUser(id);
+  }
+
+  getWechatUser(userId) {
+    this.#assertInitialized();
+    const id = requiredText(userId, "微信用户 ID", 128);
+    return rowToWechatUser(this.db.prepare("SELECT * FROM wechat_users WHERE id = ?").get(id));
+  }
+
+  getWechatUserByOpenid(appid, openid) {
+    this.#assertInitialized();
+    const app = requiredText(appid, "微信 AppID", 128);
+    const id = requiredText(openid, "微信 OpenID", 128);
+    return rowToWechatUser(this.db.prepare("SELECT * FROM wechat_users WHERE appid = ? AND openid = ?").get(app, id));
+  }
+
+  createWechatSession(token, userId, expiresAt) {
+    this.#assertInitialized();
+    const hash = tokenHash(token, "微信会话令牌");
+    const id = requiredText(userId, "微信用户 ID", 128);
+    const expiry = requiredText(expiresAt, "微信会话过期时间", 64);
+    const createdAt = nowIso();
+    this.db.prepare(`
+      INSERT INTO wechat_sessions (token_hash, user_id, expires_at, created_at, last_seen_at, revoked_at)
+      VALUES (?, ?, ?, ?, ?, NULL)
+    `).run(hash, id, expiry, createdAt, createdAt);
+    return this.getWechatSession(token, { touch: false });
+  }
+
+  getWechatSession(token, options = {}) {
+    this.#assertInitialized();
+    if (!token) return null;
+    const hash = tokenHash(token, "微信会话令牌");
+    const now = nowIso();
+    const row = this.db.prepare(`
+      SELECT s.token_hash, s.user_id, s.expires_at, s.created_at, s.last_seen_at, s.revoked_at,
+             u.id AS wx_user_id, u.appid AS wx_appid, u.openid AS wx_openid,
+             u.unionid AS wx_unionid, u.created_at AS wx_created_at,
+             u.last_seen_at AS wx_last_seen_at
+      FROM wechat_sessions s
+      JOIN wechat_users u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+    `).get(hash, now);
+    if (!row) return null;
+    if (options.touch !== false) {
+      this.db.prepare("UPDATE wechat_sessions SET last_seen_at = ? WHERE token_hash = ?").run(now, hash);
+      row.last_seen_at = now;
+    }
+    return rowToWechatSession(row);
+  }
+
+  revokeWechatSession(token) {
+    this.#assertInitialized();
+    if (!token) return false;
+    const result = this.db.prepare("UPDATE wechat_sessions SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL")
+      .run(nowIso(), tokenHash(token, "微信会话令牌"));
+    return Number(result.changes || 0) === 1;
+  }
+
+  createWechatOauthState(stateToken, returnPath, expiresAt) {
+    this.#assertInitialized();
+    const hash = tokenHash(stateToken, "微信 OAuth state");
+    const destination = requiredText(returnPath, "微信 OAuth 返回路径", 2048);
+    const expiry = requiredText(expiresAt, "微信 OAuth state 过期时间", 64);
+    const createdAt = nowIso();
+    this.db.prepare(`
+      INSERT INTO wechat_oauth_states (state_hash, return_path, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(hash, destination, expiry, createdAt);
+    return { returnPath: destination, expiresAt: expiry, createdAt };
+  }
+
+  consumeWechatOauthState(stateToken) {
+    this.#assertInitialized();
+    if (!stateToken) return null;
+    const hash = tokenHash(stateToken, "微信 OAuth state");
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM wechat_oauth_states WHERE state_hash = ?").get(hash);
+      if (!row) return null;
+      this.db.prepare("DELETE FROM wechat_oauth_states WHERE state_hash = ?").run(hash);
+      if (row.expires_at <= nowIso()) return null;
+      return { returnPath: row.return_path, expiresAt: row.expires_at, createdAt: row.created_at };
+    });
+  }
+
+  cleanupWechatAuth() {
+    this.#assertInitialized();
+    const now = nowIso();
+    const sessions = this.db.prepare("DELETE FROM wechat_sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL").run(now);
+    const states = this.db.prepare("DELETE FROM wechat_oauth_states WHERE expires_at <= ?").run(now);
+    return { sessions: Number(sessions.changes || 0), states: Number(states.changes || 0) };
+  }
+
   getOrder(outTradeNo) {
     this.#assertInitialized();
     const id = requiredText(outTradeNo, "订单号", 128);
@@ -266,8 +465,10 @@ export class OrderStore {
 
   listOrders(options = {}) {
     this.#assertInitialized();
-    const limit = Math.min(2000, Math.max(1, Math.floor(Number(options.limit) || 200)));
-    const offset = Math.max(0, Math.floor(Number(options.offset) || 0));
+    const requestedLimit = Number(options.limit);
+    const requestedOffset = Number(options.offset);
+    const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0 ? Math.min(2000, requestedLimit) : 200;
+    const offset = Number.isSafeInteger(requestedOffset) && requestedOffset >= 0 ? Math.min(1_000_000_000, requestedOffset) : 0;
     const where = [];
     const parameters = [];
     if (options.status !== undefined && options.status !== null && options.status !== "") {
@@ -277,6 +478,10 @@ export class OrderStore {
     if (options.providerOrderId !== undefined && options.providerOrderId !== null && options.providerOrderId !== "") {
       where.push("provider_order_id = ?");
       parameters.push(requiredText(options.providerOrderId, "供应商订单号", 128));
+    }
+    if (options.userId !== undefined && options.userId !== null && options.userId !== "") {
+      where.push("user_id = ?");
+      parameters.push(requiredText(options.userId, "微信用户 ID", 128));
     }
     const sql = `SELECT * FROM orders${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
     parameters.push(limit, offset);
@@ -392,14 +597,15 @@ export class OrderStore {
     const conflict = ignoreExisting ? "ON CONFLICT(out_trade_no) DO NOTHING" : "";
     return this.db.prepare(`
       INSERT INTO orders (
-        out_trade_no, transaction_id, provider_order_id, status,
+        out_trade_no, transaction_id, provider_order_id, user_id, status,
         order_version, data_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ${conflict}
     `).run(
       normalized.outTradeNo,
       normalized.transactionId,
       normalized.providerOrderId,
+      normalized.userId,
       normalized.status,
       normalized.orderVersion,
       encodeJson(normalized.order, `订单 ${normalized.outTradeNo}`),
@@ -411,12 +617,13 @@ export class OrderStore {
   #updateNormalized(normalized) {
     const result = this.db.prepare(`
       UPDATE orders SET
-        transaction_id = ?, provider_order_id = ?, status = ?,
+        transaction_id = ?, provider_order_id = ?, user_id = ?, status = ?,
         order_version = ?, data_json = ?, updated_at = ?
       WHERE out_trade_no = ?
     `).run(
       normalized.transactionId,
       normalized.providerOrderId,
+      normalized.userId,
       normalized.status,
       normalized.orderVersion,
       encodeJson(normalized.order, `订单 ${normalized.outTradeNo}`),
