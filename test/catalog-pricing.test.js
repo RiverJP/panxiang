@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_AUTO_PRICING_RULE,
   MISSING_FROM_COMPLETE_CATALOG_REASON,
   supplierBuyPriceIdr,
   supplierProductAvailability,
   normalizeStoredSupplierAvailability,
-  autoPriceState
+  normalizeAutoPricingRule,
+  normalizeProviderFxTimestamp,
+  effectiveFxRateTimestamp,
+  autoPriceState,
+  shouldRefreshFxRate
 } from "../src/catalog-pricing.js";
 
 test("interprets ReloadN amount as IDR when the merchant account currency is IDR", () => {
@@ -113,6 +118,57 @@ test("calculates automatic CNY price from a current IDR/CNY rate", () => {
   );
   assert.equal(state.status, "ready");
   assert.equal(state.priceCny, 1.14);
+  assert.deepEqual(state.pricingRule, DEFAULT_AUTO_PRICING_RULE);
+});
+
+test("supports a configurable fixed IDR markup", () => {
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    {
+      idrPerCny: 2638.5224,
+      updatedAt: "2026-08-22T12:00:00.000Z",
+      autoPricing: { mode: "fixed", value: 500 }
+    },
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "ready");
+  assert.equal(state.priceCny, 1.29);
+  assert.deepEqual(state.pricingRule, { mode: "fixed", value: 500 });
+});
+
+test("supports a configurable percentage markup", () => {
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    {
+      idrPerCny: 2638.5224,
+      updatedAt: "2026-08-22T12:00:00.000Z",
+      autoPricing: { mode: "percent", value: 10 }
+    },
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "ready");
+  assert.equal(state.priceCny, 1.21);
+  assert.deepEqual(state.pricingRule, { mode: "percent", value: 10 });
+});
+
+test("accepts a zero markup and rejects malformed pricing rules", () => {
+  assert.deepEqual(normalizeAutoPricingRule({ mode: "fixed", value: 0 }), { mode: "fixed", value: 0 });
+  assert.deepEqual(normalizeAutoPricingRule({ mode: "percent", value: 0 }), { mode: "percent", value: 0 });
+  assert.equal(normalizeAutoPricingRule({ mode: "fixed", value: 1.5 }), null);
+  assert.equal(normalizeAutoPricingRule({ mode: "percent", value: -1 }), null);
+  assert.equal(normalizeAutoPricingRule({ mode: "percent", value: "5" }), null);
+
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    {
+      idrPerCny: 2638.5224,
+      updatedAt: "2026-08-22T12:00:00.000Z",
+      autoPricing: { mode: "percent", value: -1 }
+    },
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "invalid_pricing_rule");
+  assert.equal(state.priceCny, null);
 });
 
 test("reports the precise reason when the supplier buy price is missing", () => {
@@ -131,5 +187,118 @@ test("reports an expired exchange rate separately from missing price", () => {
     { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
   );
   assert.equal(state.status, "stale_fx");
-  assert.equal(state.reason, "汇率已过期，请刷新");
+  assert.equal(state.reason, "上游汇率行情已过期，请刷新或手动设置");
+});
+
+test("daily FX quotes remain usable through the default delay tolerance", () => {
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    { idrPerCny: 2638.5224, updatedAt: "2026-08-21T07:00:00.000Z" },
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 36 }
+  );
+  assert.equal(state.status, "ready");
+});
+
+test("rejects provider timestamps beyond the allowed future clock skew", () => {
+  const now = Date.parse("2026-08-22T13:00:00.000Z");
+  assert.equal(
+    normalizeProviderFxTimestamp(now + 5 * 60 * 1000, { now, maxFutureSkewSeconds: 300 }),
+    "2026-08-22T13:05:00.000Z"
+  );
+  assert.equal(normalizeProviderFxTimestamp(now + 5 * 60 * 1000 + 1, { now, maxFutureSkewSeconds: 300 }), null);
+  assert.equal(normalizeProviderFxTimestamp("not-a-date", { now }), null);
+});
+
+test("automatic pricing uses the same future clock-skew tolerance as FX ingestion", () => {
+  const now = Date.parse("2026-08-22T13:00:00.000Z");
+  const accepted = autoPriceState(
+    { buyPriceIdr: 2900 },
+    { idrPerCny: 2638.5224, updateMode: "automatic", providerUpdatedAt: "2026-08-22T13:05:00.000Z" },
+    { now, maxFutureSkewSeconds: 300 }
+  );
+  const rejected = autoPriceState(
+    { buyPriceIdr: 2900 },
+    { idrPerCny: 2638.5224, updateMode: "automatic", providerUpdatedAt: "2026-08-22T13:05:00.001Z" },
+    { now, maxFutureSkewSeconds: 300 }
+  );
+  assert.equal(accepted.status, "ready");
+  assert.equal(rejected.status, "stale_fx");
+});
+
+test("uses provider quote time rather than fetch time for automatic rate freshness", () => {
+  const fx = {
+    idrPerCny: 2638.5224,
+    updateMode: "automatic",
+    providerUpdatedAt: "2026-08-20T12:00:00.000Z",
+    fetchedAt: "2026-08-22T12:55:00.000Z",
+    updatedAt: "2026-08-22T12:55:00.000Z"
+  };
+  assert.equal(effectiveFxRateTimestamp(fx), fx.providerUpdatedAt);
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    fx,
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "stale_fx");
+  assert.equal(state.priceCny, null);
+});
+
+test("does not treat an automatic rate with no provider timestamp as fresh", () => {
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    {
+      idrPerCny: 2638.5224,
+      updateMode: "automatic",
+      fetchedAt: "2026-08-22T12:55:00.000Z",
+      updatedAt: "2026-08-22T12:55:00.000Z"
+    },
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "stale_fx");
+  assert.equal(state.reason, "上游未提供行情时间，无法确认汇率新鲜度");
+});
+
+test("manual rates use their effective save time", () => {
+  const fx = {
+    idrPerCny: 2638.5224,
+    updateMode: "manual",
+    effectiveRateUpdatedAt: "2026-08-22T12:55:00.000Z",
+    providerUpdatedAt: "2026-08-20T00:00:00.000Z",
+    updatedAt: "2026-08-22T12:55:00.000Z"
+  };
+  assert.equal(effectiveFxRateTimestamp(fx), fx.effectiveRateUpdatedAt);
+  const state = autoPriceState(
+    { buyPriceIdr: 2900 },
+    fx,
+    { now: Date.parse("2026-08-22T13:00:00.000Z"), maxFxAgeHours: 24 }
+  );
+  assert.equal(state.status, "ready");
+});
+
+test("FX scheduling retries stale quotes quickly without retrying fresh quotes too often", () => {
+  const now = Date.parse("2026-08-22T13:00:00.000Z");
+  const staleFx = {
+    idrPerCny: 2638.5224,
+    updateMode: "automatic",
+    providerUpdatedAt: "2026-08-20T00:00:00.000Z",
+    fetchedAt: "2026-08-22T12:45:00.000Z",
+    updatedAt: "2026-08-22T12:45:00.000Z"
+  };
+  assert.equal(shouldRefreshFxRate(staleFx, { now }), false);
+  assert.equal(shouldRefreshFxRate(staleFx, { now: now + 16 * 60 * 1000 }), true);
+
+  const freshFx = {
+    ...staleFx,
+    providerUpdatedAt: "2026-08-22T12:00:00.000Z",
+    fetchedAt: "2026-08-22T12:45:00.000Z",
+    updatedAt: "2026-08-22T12:45:00.000Z"
+  };
+  assert.equal(shouldRefreshFxRate(freshFx, { now }), false);
+  assert.equal(shouldRefreshFxRate(freshFx, { now: now + 8 * 60 * 60 * 1000 }), true);
+});
+
+test("FX scheduling backs off after a failed recovery attempt", () => {
+  const now = Date.parse("2026-08-22T13:00:00.000Z");
+  assert.equal(shouldRefreshFxRate(null, { now, lastAttemptAt: now - 5 * 60 * 1000 }), false);
+  assert.equal(shouldRefreshFxRate(null, { now, lastAttemptAt: now - 31 * 60 * 1000 }), true);
 });

@@ -15,13 +15,14 @@
       <nav class="admin-nav" aria-label="后台导航">
         <button class="nav-item active" data-section="products"><span>▦</span>商品中心</button>
         <button class="nav-item" data-section="published"><span>↕</span>上架商品</button>
+        <button class="nav-item" data-section="services"><span>◇</span>生活服务</button>
         <button class="nav-item" data-section="orders"><span>◫</span>订单中心</button>
       </nav>
       <p class="nav-label">系统</p>
       <nav class="admin-nav">
         <button class="nav-item" data-section="system"><span>⚙</span>系统状态</button>
       </nav>
-      <div class="sidebar-foot"><span class="health-dot"></span>生产服务运行中</div>
+      <div class="sidebar-foot"><span class="health-dot pending"></span>后台状态检查中</div>
     </aside>
 
     <main class="admin-main">
@@ -65,7 +66,7 @@
             <span id="selectedCount">已选择 0 项</span>
             <button class="mini-button" id="bulkPublish">批量上架</button>
             <button class="mini-button danger" id="bulkUnpublish">批量下架</button>
-            <span class="formula">自动售价 =（IDR 买入价 + 120）÷ 当前 IDR/CNY 汇率</span>
+            <span class="formula" id="autoPricingFormula">自动售价按系统定价规则计算</span>
           </div>
           <div class="table-scroll">
             <table class="data-table product-table">
@@ -109,6 +110,35 @@
         </section>
       </section>
 
+      <section class="admin-content section" id="section-services">
+        <div class="page-heading">
+          <div><p class="kicker">LIFE SERVICES</p><h1>生活服务管理</h1><p>维护前台“印尼生活服务”页面。只有启用的项目会按排序值从小到大展示。</p></div>
+          <button class="button secondary" id="refreshServices" type="button">刷新服务</button>
+        </div>
+
+        <section class="admin-panel service-create-panel">
+          <div class="card-title"><div><h2>添加服务</h2><p>服务名称必填；说明会展示在前台服务卡片和客服咨询弹层中。</p></div><span class="service-total"><b id="serviceCount">0</b> 个服务</span></div>
+          <form id="serviceCreateForm" class="service-create-form">
+            <label><span>服务名称</span><input id="serviceTitle" maxlength="40" required placeholder="例如：租房咨询"></label>
+            <label class="service-description-field"><span>服务说明</span><textarea id="serviceDescription" maxlength="240" rows="2" placeholder="简要说明服务范围，最多 240 字"></textarea></label>
+            <label><span>排序</span><input id="serviceSortOrder" type="number" min="0" max="1000000" step="1" value="10" inputmode="numeric"></label>
+            <label class="service-enabled-field"><span>前台启用</span><span class="switch"><input id="serviceEnabled" type="checkbox" checked><span class="slider"></span></span></label>
+            <button class="button primary" id="createService" type="submit">添加服务</button>
+          </form>
+        </section>
+
+        <section class="admin-panel service-list-panel">
+          <div class="published-order-head"><div><strong>现有服务</strong><span>可直接修改名称、说明、排序和启用状态，再点击保存</span></div><span>删除前会再次确认</span></div>
+          <div class="table-scroll">
+            <table class="data-table service-table">
+              <thead><tr><th>服务名称</th><th>服务说明</th><th>排序</th><th>前台启用</th><th>操作</th></tr></thead>
+              <tbody id="serviceRows"><tr><td colspan="5" class="empty-state">正在加载服务…</td></tr></tbody>
+            </table>
+          </div>
+          <div class="panel-footer"><span>排序值越小越靠前；停用不会删除数据，可随时重新启用</span><span>前台刷新后立即生效</span></div>
+        </section>
+      </section>
+
       <section class="admin-content section" id="section-orders">
         <div class="page-heading">
           <div><p class="kicker">ORDER OPERATIONS</p><h1>订单中心</h1><p>集中查看微信支付状态和 ReloadN 充值处理结果。</p></div>
@@ -128,9 +158,18 @@
         <div class="page-heading"><div><p class="kicker">SYSTEM STATUS</p><h1>系统状态</h1><p>查看自动任务、同步结果、汇率来源和后台操作记录。</p></div><button class="button secondary" id="refreshSystem">刷新状态</button></div>
         <div class="system-grid">
           <section class="admin-panel settings-card">
-            <div class="card-title"><div><h2>汇率与定价</h2><p>自动汇率每 8 小时检查一次，也可临时手动设定。</p></div><span class="status-badge success">正常</span></div>
+            <div class="card-title"><div><h2>汇率与定价</h2><p>自动汇率每 8 小时检查一次；默认免费行情源约每天更新一次。</p></div><span class="status-badge pending" id="fxHealthBadge" title="正在检查汇率与定价状态">检查中</span></div>
             <label class="settings-field"><span>IDR / CNY 汇率</span><div><input id="manualFx" inputmode="decimal" placeholder="例如 2300"><button class="button primary" id="saveFx">保存手动汇率</button></div></label>
-            <dl class="detail-list"><div><dt>当前来源</dt><dd id="fxSource">—</dd></div><div><dt>更新时间</dt><dd id="fxUpdated">—</dd></div><div><dt>自动刷新</dt><dd>每 8 小时</dd></div></dl>
+            <div class="settings-field">
+              <span>自动售价加价规则</span>
+              <div class="pricing-rule-controls">
+                <select id="pricingMode" aria-label="自动售价加价模式"><option value="fixed">固定金额（IDR）</option><option value="percent">买入价比例（%）</option></select>
+                <input id="pricingValue" type="number" min="0" step="1" inputmode="decimal" placeholder="例如 120" aria-label="自动售价加价值">
+                <button class="button primary" id="savePricing">保存定价规则</button>
+              </div>
+              <small class="settings-help" id="pricingRuleHelp">固定金额：自动售价 =（买入价 + 配置值）÷ 汇率；手动定价商品不受影响。</small>
+            </div>
+            <dl class="detail-list"><div><dt>当前来源</dt><dd id="fxSource">—</dd></div><div><dt>上游行情时间</dt><dd id="fxProviderUpdated">—</dd></div><div><dt>最近获取/设置</dt><dd id="fxUpdated">—</dd></div><div><dt>自动刷新</dt><dd id="fxRefreshPolicy">正常每 8 小时；异常 30 分钟重试</dd></div></dl>
           </section>
           <section class="admin-panel settings-card">
             <div class="card-title"><div><h2>供应商同步</h2><p>每天检查一次完整 SKU 目录并跟随分页游标。</p></div><span class="status-badge success">已启用</span></div>

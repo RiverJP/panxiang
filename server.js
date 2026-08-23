@@ -9,11 +9,18 @@ import { catalog, findProduct, normalizePhone, detectOperator, createSupplierOrd
 import { createJsapiPrepay, buildJsapiPayParams, verifyAndDecryptNotification } from "./src/wechat.js";
 import { createOrderStore } from "./src/order-store.js";
 import {
+  DEFAULT_AUTO_PRICING_RULE,
+  MAX_FIXED_MARKUP_IDR,
+  MAX_PERCENT_MARKUP,
   MISSING_FROM_COMPLETE_CATALOG_REASON,
   supplierBuyPriceIdr,
   supplierProductAvailability,
   normalizeStoredSupplierAvailability,
-  autoPriceState
+  normalizeAutoPricingRule,
+  normalizeProviderFxTimestamp,
+  effectiveFxRateTimestamp,
+  autoPriceState,
+  shouldRefreshFxRate
 } from "./src/catalog-pricing.js";
 import {
   appendCatalogDisplayOrder,
@@ -26,6 +33,7 @@ import {
   normalizeCatalogSortOrder
 } from "./src/catalog-display.js";
 import { defaultCustomerServiceUrl, normalizeCustomerServiceUrl } from "./src/public-config.js";
+import { MAX_LIFE_SERVICES, compareLifeServices, normalizeLifeService, normalizeLifeServices, publicLifeServices, validateLifeServicesStrict } from "./src/life-services.js";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envFile = path.join(root, ".env");
@@ -45,9 +53,14 @@ const fxFile = path.join(dataDir, "fx.json");
 const ordersFile = path.join(dataDir, "orders.json");
 const syncMetaFile = path.join(dataDir, "sync-meta.json");
 const auditFile = path.join(dataDir, "admin-audit.json");
+const lifeServicesFile = path.join(dataDir, "life-services.json");
 const orderStore = createOrderStore({ dbPath: path.join(dataDir, "orders.sqlite"), legacyJsonPath: ordersFile });
 const rechargeLocks = new Set();
 let catalogMutationTail = Promise.resolve();
+let fxMutationTail = Promise.resolve();
+let lifeServicesMutationTail = Promise.resolve();
+let auditMutationTail = Promise.resolve();
+let lastScheduledFxRefreshAttemptAt = 0;
 
 async function withCatalogMutationLock(work) {
   const previous = catalogMutationTail;
@@ -61,8 +74,41 @@ async function withCatalogMutationLock(work) {
   }
 }
 
+async function withFxMutationLock(work) {
+  const previous = fxMutationTail;
+  let release;
+  fxMutationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+async function withLifeServicesMutationLock(work) {
+  const previous = lifeServicesMutationTail;
+  let release;
+  lifeServicesMutationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
 async function readJson(file, fallback) {
   try { return JSON.parse(await fs.readFile(file, "utf8")); } catch { return fallback; }
+}
+
+async function readJsonStrict(file, fallback) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return fallback;
+    throw new Error(`${path.basename(file)} 无法读取或 JSON 已损坏，请先恢复该文件`, { cause: error });
+  }
 }
 
 async function writeJson(file, value) {
@@ -72,10 +118,113 @@ async function writeJson(file, value) {
   await fs.rename(temporary, file);
 }
 
+function fxStateForAdmin(fx) {
+  const state = fx && typeof fx === "object" && !Array.isArray(fx) ? fx : {};
+  const normalizedPricing = normalizeAutoPricingRule(state.autoPricing);
+  const effectiveState = {
+    ...state,
+    autoPricing: normalizedPricing || state.autoPricing || { ...DEFAULT_AUTO_PRICING_RULE }
+  };
+  const pricing = autoPriceState({ buyPriceIdr: 10_000 }, effectiveState);
+  return {
+    ...effectiveState,
+    autoPricingValid: Boolean(normalizedPricing),
+    pricingReady: pricing.status === "ready",
+    pricingHealth: pricing.status,
+    pricingHealthReason: pricing.reason,
+    effectiveRateTimestamp: effectiveFxRateTimestamp(effectiveState)
+  };
+}
+
+function providerRateTimestamp(data) {
+  const unixSeconds = Number(data?.time_last_update_unix);
+  const date = String(data?.date || "").trim();
+  const candidate = Number.isFinite(unixSeconds) && unixSeconds > 0
+    ? unixSeconds * 1000
+    : (/^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date}T00:00:00.000Z` : null);
+  return normalizeProviderFxTimestamp(candidate, {
+    maxFutureSkewSeconds: Number(process.env.FX_MAX_FUTURE_SKEW_SECONDS || 300)
+  });
+}
+
 async function appendAudit(action, details = {}) {
-  const entries = await readJson(auditFile, []);
-  entries.push({ action, details, at: new Date().toISOString() });
-  await writeJson(auditFile, entries.slice(-1000));
+  const previous = auditMutationTail;
+  let release;
+  auditMutationTail = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const entries = await readJson(auditFile, []);
+    entries.push({ action, details, at: new Date().toISOString() });
+    await writeJson(auditFile, entries.slice(-1000));
+  } catch (error) {
+    // Auditing must never make an already-applied business change look like it
+    // failed to the operator. Keep the failure visible in the service log.
+    console.error("Admin audit write failed:", error.message);
+  } finally {
+    release();
+  }
+}
+
+async function readLifeServices({ strict = false } = {}) {
+  if (!strict) return normalizeLifeServices(await readJson(lifeServicesFile, null));
+  const missing = Symbol("missing-life-services");
+  const stored = await readJsonStrict(lifeServicesFile, missing);
+  return stored === missing ? normalizeLifeServices(null) : validateLifeServicesStrict(stored);
+}
+
+function sortedLifeServices(services) {
+  return [...services].sort(compareLifeServices);
+}
+
+function nextLifeServiceSortOrder(services) {
+  const highest = services.reduce((maximum, service) => Math.max(maximum, Number(service.sortOrder) || 0), 0);
+  return Math.min(1_000_000, highest + 10);
+}
+
+function lifeServiceInput(input, { existing = null } = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { error: "请求内容必须是 JSON 对象" };
+  }
+  if (Object.hasOwn(input, "id")) return { error: "服务 ID 由系统生成，不能自行设置或修改" };
+  const allowed = new Set(["title", "description", "enabled", "sortOrder"]);
+  const unknown = Object.keys(input).filter((key) => !allowed.has(key));
+  if (unknown.length) return { error: `不支持的字段：${unknown.join("、")}` };
+  if (existing && Object.keys(input).length === 0) return { error: "请至少提交一个需要修改的字段" };
+  if ((!existing || Object.hasOwn(input, "title")) && (typeof input.title !== "string" || !input.title.trim() || input.title.trim().length > 40)) {
+    return { error: "服务名称必须是 1–40 个字符" };
+  }
+  if (Object.hasOwn(input, "description") && (typeof input.description !== "string" || input.description.trim().length > 240)) {
+    return { error: "服务说明不能超过 240 个字符" };
+  }
+  if (Object.hasOwn(input, "enabled") && typeof input.enabled !== "boolean") {
+    return { error: "启用状态必须是布尔值" };
+  }
+  if (Object.hasOwn(input, "sortOrder")) {
+    const sortOrder = Number(input.sortOrder);
+    if (!Number.isSafeInteger(sortOrder) || sortOrder < 0 || sortOrder > 1_000_000) {
+      return { error: "排序值必须是 0–1000000 的整数" };
+    }
+  }
+  const candidate = {
+    ...(existing || {}),
+    ...(Object.hasOwn(input, "title") ? { title: input.title } : {}),
+    ...(Object.hasOwn(input, "description") ? { description: input.description } : {}),
+    ...(Object.hasOwn(input, "enabled") ? { enabled: input.enabled } : {}),
+    ...(Object.hasOwn(input, "sortOrder") ? { sortOrder: Number(input.sortOrder) } : {})
+  };
+  const service = normalizeLifeService(candidate, { requireId: Boolean(existing) });
+  return service ? { service } : { error: "服务资料不完整或格式不正确" };
+}
+
+function lifeServiceIdFromPath(pathname) {
+  const match = pathname.match(/^\/api\/admin\/services\/([^/]+)$/);
+  if (!match) return null;
+  try {
+    const id = decodeURIComponent(match[1]);
+    return /^[a-zA-Z0-9_-]{1,80}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
 }
 
 async function migrateStoredProductAvailability() {
@@ -476,23 +625,67 @@ function appendNewlyPublishedProducts(products, skus, fx) {
 }
 
 async function refreshFxRate(source = "manual") {
+  const refreshStartedAt = Date.now();
   const fxUrl = process.env.FX_RATE_URL || "https://open.er-api.com/v6/latest/CNY";
-  const response = await fetch(fxUrl, { signal: AbortSignal.timeout(10000) });
+  // The network request deliberately stays outside the mutation lock. Only
+  // reading the current record, applying safety checks and writing the new
+  // record need serialization; a slow rate provider must not block a manual
+  // rate or pricing-rule update.
+  const response = await fetch(fxUrl, {
+    signal: AbortSignal.timeout(10000),
+    headers: { accept: "application/json", "cache-control": "no-cache" }
+  });
   if (!response.ok) throw new Error(`汇率服务返回 ${response.status}`);
   const data = await response.json();
+  if (data?.result && data.result !== "success") throw new Error("汇率服务返回失败状态");
+  if (data?.base_code && String(data.base_code).toUpperCase() !== "CNY") throw new Error("汇率服务基准币种不是 CNY");
   const idrPerCny = Number(data?.rates?.IDR);
   const minRate = Number(process.env.FX_IDR_CNY_MIN || 1000);
   const maxRate = Number(process.env.FX_IDR_CNY_MAX || 5000);
   if (!Number.isFinite(idrPerCny) || idrPerCny < minRate || idrPerCny > maxRate) throw new Error("汇率响应超出安全范围，未更新自动售价");
-  const previous = await readJson(fxFile, null);
-  const previousRate = Number(previous?.idrPerCny);
-  const maxChangeRatio = Number(process.env.FX_MAX_CHANGE_RATIO || 0.15);
-  if (Number.isFinite(previousRate) && previousRate > 0 && Math.abs(idrPerCny / previousRate - 1) > maxChangeRatio) {
-    throw new Error("汇率变动超过安全阈值，需在后台人工确认");
-  }
-  const fx = { idrPerCny, source: fxUrl, updateMode: "automatic", trigger: source, updatedAt: new Date().toISOString() };
-  await writeJson(fxFile, fx);
-  return fx;
+  const providerUpdatedAt = providerRateTimestamp(data);
+  if (!providerUpdatedAt) throw new Error("汇率服务未返回有效的行情时间，未更新自动售价");
+  const providerNextUpdateAt = Number.isFinite(Number(data?.time_next_update_unix)) && Number(data.time_next_update_unix) > 0
+    ? new Date(Number(data.time_next_update_unix) * 1000).toISOString()
+    : null;
+
+  return withFxMutationLock(async () => {
+    const previous = await readJsonStrict(fxFile, null);
+    const previousUpdatedAt = Date.parse(previous?.updatedAt || "");
+    if (previous?.updateMode === "manual" && Number.isFinite(previousUpdatedAt) && previousUpdatedAt > refreshStartedAt) {
+      throw new Error("汇率在本次获取期间已被手动修改，在线报价未覆盖人工设置");
+    }
+    const previousRate = Number(previous?.idrPerCny);
+    const maxChangeRatio = Number(process.env.FX_MAX_CHANGE_RATIO || 0.15);
+    if (Number.isFinite(previousRate) && previousRate > 0 && Math.abs(idrPerCny / previousRate - 1) > maxChangeRatio) {
+      throw new Error("汇率变动超过安全阈值，需在后台人工确认");
+    }
+    const previousQuoteTime = Date.parse(previous?.providerUpdatedAt || "");
+    const incomingQuoteTime = Date.parse(providerUpdatedAt);
+    if (previous?.updateMode === "automatic" && Number.isFinite(previousQuoteTime) && incomingQuoteTime < previousQuoteTime) {
+      throw new Error("汇率服务返回的行情时间早于当前记录，已拒绝覆盖");
+    }
+    const fetchedAt = new Date().toISOString();
+    const autoPricing = previous && Object.hasOwn(previous, "autoPricing")
+      ? previous.autoPricing
+      : { ...DEFAULT_AUTO_PRICING_RULE };
+    const fx = {
+      ...(previous || {}),
+      idrPerCny,
+      source: fxUrl,
+      updateMode: "automatic",
+      trigger: source,
+      rateChanged: !Number.isFinite(previousRate) || previousRate !== idrPerCny,
+      providerUpdatedAt,
+      providerNextUpdateAt,
+      effectiveRateUpdatedAt: providerUpdatedAt,
+      fetchedAt,
+      updatedAt: fetchedAt,
+      autoPricing
+    };
+    await writeJson(fxFile, fx);
+    return fx;
+  });
 }
 
 async function syncSupplierCatalog(source = "manual") {
@@ -748,6 +941,68 @@ async function adminApi(req, res, url) {
     return json(res, 200, { ok: true }, { "set-cookie": `${adminCookieName}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict` });
   }
   if (!requireAdmin(req, res, !["GET", "HEAD"].includes(req.method))) return true;
+  if (req.method === "GET" && url.pathname === "/api/admin/services") {
+    return json(res, 200, { ok: true, services: sortedLifeServices(await readLifeServices({ strict: true })), maximum: MAX_LIFE_SERVICES });
+  }
+  if (req.method === "POST" && url.pathname === "/api/admin/services") {
+    let input;
+    try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    if (!input || typeof input !== "object" || Array.isArray(input)) return json(res, 400, { ok: false, message: "请求内容必须是 JSON 对象" });
+    return withLifeServicesMutationLock(async () => {
+      const services = await readLifeServices({ strict: true });
+      if (services.length >= MAX_LIFE_SERVICES) return json(res, 409, { ok: false, message: `生活服务最多支持 ${MAX_LIFE_SERVICES} 项` });
+      const prepared = {
+        ...input,
+        enabled: Object.hasOwn(input, "enabled") ? input.enabled : true,
+        description: Object.hasOwn(input, "description") ? input.description : "",
+        sortOrder: Object.hasOwn(input, "sortOrder") ? input.sortOrder : nextLifeServiceSortOrder(services)
+      };
+      const validated = lifeServiceInput(prepared);
+      if (!validated.service) return json(res, 400, { ok: false, message: validated.error });
+      const service = { ...validated.service, id: `svc_${crypto.randomBytes(12).toString("hex")}` };
+      services.push(service);
+      await writeJson(lifeServicesFile, sortedLifeServices(services));
+      await appendAudit("service.create", { id: service.id, title: service.title, enabled: service.enabled, sortOrder: service.sortOrder });
+      return json(res, 201, { ok: true, service, services: sortedLifeServices(services), maximum: MAX_LIFE_SERVICES });
+    });
+  }
+  if (["PUT", "PATCH", "DELETE"].includes(req.method) && url.pathname.startsWith("/api/admin/services/")) {
+    const serviceId = lifeServiceIdFromPath(url.pathname);
+    if (!serviceId) return json(res, 400, { ok: false, message: "服务 ID 格式错误" });
+    if (req.method === "DELETE") {
+      return withLifeServicesMutationLock(async () => {
+        const services = await readLifeServices({ strict: true });
+        const index = services.findIndex((service) => service.id === serviceId);
+        if (index < 0) return json(res, 404, { ok: false, message: "生活服务不存在" });
+        const [deleted] = services.splice(index, 1);
+        await writeJson(lifeServicesFile, sortedLifeServices(services));
+        await appendAudit("service.delete", { id: deleted.id, title: deleted.title });
+        return json(res, 200, { ok: true, deletedId: deleted.id, services: sortedLifeServices(services), maximum: MAX_LIFE_SERVICES });
+      });
+    }
+    let input;
+    try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    return withLifeServicesMutationLock(async () => {
+      const services = await readLifeServices({ strict: true });
+      const index = services.findIndex((service) => service.id === serviceId);
+      if (index < 0) return json(res, 404, { ok: false, message: "生活服务不存在" });
+      const validated = lifeServiceInput(input, { existing: services[index] });
+      if (!validated.service) return json(res, 400, { ok: false, message: validated.error });
+      const previous = services[index];
+      const service = { ...validated.service, id: serviceId };
+      services[index] = service;
+      await writeJson(lifeServicesFile, sortedLifeServices(services));
+      await appendAudit("service.update", {
+        id: service.id,
+        title: service.title,
+        enabled: service.enabled,
+        sortOrder: service.sortOrder,
+        changedFields: Object.keys(input),
+        previousTitle: previous.title
+      });
+      return json(res, 200, { ok: true, service, services: sortedLifeServices(services), maximum: MAX_LIFE_SERVICES });
+    });
+  }
   if (req.method === "GET" && url.pathname === "/api/admin/products") {
     const products = await readJson(productsFile, []);
     const fx = await readJson(fxFile, null);
@@ -895,26 +1150,83 @@ async function adminApi(req, res, url) {
       return json(res, 200, { ok: true, product: adminProductView(product, fx), publishedOrder: publishedCatalogOrderState(products, fx) });
     });
   }
-  if (req.method === "GET" && url.pathname === "/api/admin/fx") return json(res, 200, { ok: true, fx: await readJson(fxFile, null) });
+  if (req.method === "GET" && url.pathname === "/api/admin/fx") {
+    return json(res, 200, { ok: true, fx: fxStateForAdmin(await readJson(fxFile, null)) });
+  }
   if (req.method === "POST" && url.pathname === "/api/admin/fx/refresh") {
     try {
       const fx = await refreshFxRate("manual");
-      await appendAudit("fx.refresh", { idrPerCny: fx.idrPerCny });
-      return json(res, 200, { ok: true, fx });
+      await appendAudit("fx.refresh", { idrPerCny: fx.idrPerCny, rateChanged: fx.rateChanged, providerUpdatedAt: fx.providerUpdatedAt });
+      return json(res, 200, { ok: true, fx: fxStateForAdmin(fx) });
     } catch (error) {
       return json(res, 502, { ok: false, message: error.message || "汇率刷新失败" });
     }
   }
   if (req.method === "PUT" && url.pathname === "/api/admin/fx") {
     let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return json(res, 400, { ok: false, message: "请求必须包含 IDR/CNY 汇率" });
+    }
     const idrPerCny = Number(input.idrPerCny);
     const minRate = Number(process.env.FX_IDR_CNY_MIN || 1000);
     const maxRate = Number(process.env.FX_IDR_CNY_MAX || 5000);
     if (!Number.isFinite(idrPerCny) || idrPerCny < minRate || idrPerCny > maxRate) return json(res, 400, { ok: false, message: `汇率需在 ${minRate}–${maxRate} IDR/CNY 范围内` });
-    const fx = { idrPerCny, source: "manual", updateMode: "manual", updatedAt: new Date().toISOString() };
-    await writeJson(fxFile, fx);
+    const fx = await withFxMutationLock(async () => {
+      const previous = await readJsonStrict(fxFile, null);
+      const updatedAt = new Date().toISOString();
+      const autoPricing = previous && Object.hasOwn(previous, "autoPricing")
+        ? previous.autoPricing
+        : { ...DEFAULT_AUTO_PRICING_RULE };
+      const next = {
+        ...(previous || {}),
+        idrPerCny,
+        source: "manual",
+        updateMode: "manual",
+        trigger: "manual",
+        rateChanged: Number(previous?.idrPerCny) !== idrPerCny,
+        providerUpdatedAt: null,
+        providerNextUpdateAt: null,
+        effectiveRateUpdatedAt: updatedAt,
+        fetchedAt: null,
+        updatedAt,
+        autoPricing
+      };
+      await writeJson(fxFile, next);
+      return next;
+    });
     await appendAudit("fx.manual_update", { idrPerCny });
-    return json(res, 200, { ok: true, fx });
+    return json(res, 200, { ok: true, fx: fxStateForAdmin(fx) });
+  }
+  if (req.method === "PUT" && url.pathname === "/api/admin/pricing") {
+    let input; try { input = JSON.parse(await readBody(req)); } catch { return json(res, 400, { ok: false, message: "请求格式错误" }); }
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return json(res, 400, { ok: false, message: "请求必须包含自动定价规则" });
+    }
+    const requestedRule = { mode: input?.mode, value: input?.value };
+    const rule = normalizeAutoPricingRule(requestedRule, { useDefaultWhenMissing: false });
+    if (!rule) {
+      const message = requestedRule.mode === "fixed"
+        ? `固定加价必须是 0–${MAX_FIXED_MARKUP_IDR.toLocaleString("zh-CN")} 的整数 IDR`
+        : requestedRule.mode === "percent"
+          ? `比例加价必须是 0–${MAX_PERCENT_MARKUP.toLocaleString("zh-CN")} 的数字百分比`
+          : "自动定价模式必须是固定加价或比例加价";
+      return json(res, 400, { ok: false, message });
+    }
+    const saved = await withFxMutationLock(async () => {
+      const previousFx = await readJsonStrict(fxFile, null);
+      const previousRule = normalizeAutoPricingRule(previousFx?.autoPricing) || { ...DEFAULT_AUTO_PRICING_RULE };
+      const autoPricing = { ...rule, updatedAt: new Date().toISOString() };
+      const fx = { ...(previousFx || {}), autoPricing };
+      await writeJson(fxFile, fx);
+      return { fx, previousRule, autoPricing };
+    });
+    await appendAudit("pricing.rule_update", {
+      previousMode: saved.previousRule.mode,
+      previousValue: saved.previousRule.value,
+      mode: saved.autoPricing.mode,
+      value: saved.autoPricing.value
+    });
+    return json(res, 200, { ok: true, fx: fxStateForAdmin(saved.fx) });
   }
   if (req.method === "GET" && url.pathname === "/api/admin/orders") {
     return json(res, 200, { ok: true, orders: orderStore.listOrders({ limit: 2000 }) });
@@ -941,7 +1253,7 @@ async function adminApi(req, res, url) {
         published: products.filter((product) => product.published && product.active === true).length,
         unavailable: products.filter((product) => product.active === false).length,
         orders: orderStore.listOrders({ limit: 2000 }).length,
-        fx,
+        fx: fxStateForAdmin(fx),
         sync,
         schedules: { productSyncHours: 24, fxRefreshHours: 8 }
       }
@@ -984,6 +1296,9 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "GET" && url.pathname === "/api/public-config") {
     return json(res, 200, { ok: true, customerServiceUrl: normalizeCustomerServiceUrl(process.env.WECOM_CUSTOMER_SERVICE_URL || defaultCustomerServiceUrl) });
+  }
+  if (req.method === "GET" && url.pathname === "/api/services") {
+    return json(res, 200, { ok: true, services: publicLifeServices(await readLifeServices()) });
   }
   if (req.method === "GET" && url.pathname === "/api/catalog") {
     const managed = await readJson(productsFile, []);
@@ -1261,8 +1576,10 @@ async function scheduledMaintenance() {
     }
     try {
       const fx = await readJson(fxFile, null);
-      const fxAge = now - Date.parse(fx?.updatedAt || 0);
-      if (!fx || !Number.isFinite(fxAge) || fxAge >= 8 * 60 * 60 * 1000) await refreshFxRate("scheduled");
+      if (shouldRefreshFxRate(fx, { now, lastAttemptAt: lastScheduledFxRefreshAttemptAt })) {
+        lastScheduledFxRefreshAttemptAt = now;
+        await refreshFxRate("scheduled");
+      }
     } catch (error) {
       console.error("Scheduled FX refresh failed:", error.message);
     }

@@ -3,6 +3,7 @@
 const state = {
   csrfToken: "",
   products: [],
+  services: [],
   orders: [],
   selectedSkus: new Set(),
   publishedOrder: [],
@@ -21,6 +22,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const productMutationsInFlight = new Set();
 let productLoadRequestId = 0;
 let lastAppliedProductLoadRequestId = 0;
+let serviceLoadRequestId = 0;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({
@@ -51,6 +53,107 @@ function formatMoney(value, currency = "CNY") {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
   return `${currency === "CNY" ? "¥" : ""}${number.toFixed(2)}${currency === "CNY" ? "" : ` ${currency}`}`;
+}
+
+const DEFAULT_PRICING_RULE = Object.freeze({ mode: "fixed", value: 120 });
+
+function pricingRuleFromFx(fx = state.fx) {
+  const mode = String(fx?.autoPricing?.mode || "").toLowerCase();
+  const value = Number(fx?.autoPricing?.value);
+  if (["fixed", "percent"].includes(mode) && Number.isFinite(value) && value >= 0) return { mode, value };
+  return { ...DEFAULT_PRICING_RULE };
+}
+
+function pricingFormula(rule, { compact = false } = {}) {
+  if (rule.mode === "percent") {
+    return compact
+      ? `自动售价 = IDR 买入价 ×（1 + ${rule.value}%）÷ 当前 IDR/CNY 汇率`
+      : `比例加价：自动售价 = 买入价 ×（1 + ${rule.value}%）÷ 汇率；手动定价商品不受影响。`;
+  }
+  const value = Number(rule.value).toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+  return compact
+    ? `自动售价 =（IDR 买入价 + ${value} IDR）÷ 当前 IDR/CNY 汇率`
+    : `固定金额：自动售价 =（买入价 + ${value} IDR）÷ 汇率；手动定价商品不受影响。`;
+}
+
+function updatePricingDraftHelp() {
+  const mode = $("#pricingMode")?.value === "percent" ? "percent" : "fixed";
+  const input = $("#pricingValue");
+  if (!input) return;
+  input.step = mode === "fixed" ? "1" : "0.01";
+  input.max = mode === "fixed" ? "1000000" : "1000";
+  input.placeholder = mode === "fixed" ? "例如 120" : "例如 5";
+  const value = Number(input.value);
+  const previewRule = { mode, value: Number.isFinite(value) && value >= 0 ? value : 0 };
+  $("#pricingRuleHelp").textContent = pricingFormula(previewRule);
+}
+
+function formatFxSource(source) {
+  if (source === "manual") return "后台手动设置";
+  if (String(source || "").includes("open.er-api.com")) return "ExchangeRate-API 免费行情";
+  return source || "—";
+}
+
+function fxHealthPresentation(fx) {
+  if (fx?.pricingReady === true) return { tone: "success", label: "可自动定价", reason: fx.pricingHealthReason || "汇率与定价规则有效" };
+  if (fx?.pricingHealth === "stale_fx") return { tone: "warning", label: "报价已过期", reason: fx.pricingHealthReason || "请刷新或手动设置汇率" };
+  if (["missing_fx"].includes(fx?.pricingHealth)) return { tone: "warning", label: "等待汇率", reason: fx.pricingHealthReason || "尚未配置汇率" };
+  return { tone: "error", label: "需要处理", reason: fx?.pricingHealthReason || "汇率或自动定价规则不可用" };
+}
+
+function renderFxHealth(fx) {
+  const health = fxHealthPresentation(fx);
+  const badge = $("#fxHealthBadge");
+  if (badge) {
+    badge.className = `status-badge ${health.tone}`;
+    badge.textContent = health.label;
+    badge.title = health.reason;
+  }
+  const foot = $(".sidebar-foot");
+  if (foot) {
+    const dotTone = health.tone === "success" ? "success" : health.tone;
+    foot.innerHTML = `<span class="health-dot ${dotTone}"></span>后台已连接 · ${escapeHtml(health.label)}`;
+    foot.title = health.reason;
+  }
+}
+
+function renderFxState(fx) {
+  state.fx = fx || null;
+  const rate = Number(state.fx?.idrPerCny);
+  $("#statRate").textContent = Number.isFinite(rate) ? rate.toLocaleString("zh-CN", { maximumFractionDigits: 4 }) : "—";
+  const isManual = state.fx?.updateMode === "manual" || state.fx?.source === "manual";
+  const quoteTime = isManual ? null : state.fx?.providerUpdatedAt;
+  const effectiveTime = state.fx?.effectiveRateTimestamp || state.fx?.effectiveRateUpdatedAt || state.fx?.updatedAt;
+  const activityTime = isManual ? state.fx?.updatedAt : (state.fx?.fetchedAt || state.fx?.updatedAt);
+  $("#statRateTime").textContent = isManual
+    ? (effectiveTime ? `手动设置 ${formatDate(effectiveTime)}` : "等待手动汇率")
+    : (quoteTime ? `上游行情 ${formatDate(quoteTime)}` : (activityTime ? `获取于 ${formatDate(activityTime)}` : "等待汇率更新"));
+  $("#manualFx").value = Number.isFinite(rate) ? String(rate) : "";
+  const sourceLabel = formatFxSource(state.fx?.source);
+  $("#fxSource").textContent = sourceLabel;
+  $("#fxSource").title = state.fx?.source || "";
+  $("#fxProviderUpdated").textContent = isManual ? "不适用（手动汇率）" : formatDate(quoteTime, "上游未提供");
+  $("#fxUpdated").textContent = formatDate(activityTime);
+  const refreshPolicy = $("#fxRefreshPolicy");
+  if (refreshPolicy) {
+    const activityTimestamp = Date.parse(activityTime || "");
+    const nextAutomaticAt = isManual && Number.isFinite(activityTimestamp)
+      ? new Date(activityTimestamp + 8 * 60 * 60 * 1000).toISOString()
+      : null;
+    refreshPolicy.textContent = isManual
+      ? `手动值临时生效；预计 ${formatDate(nextAutomaticAt)} 后由在线报价覆盖，也可立即点“刷新汇率”`
+      : "正常每 8 小时；异常 30 分钟重试";
+  }
+
+  const rule = pricingRuleFromFx(state.fx);
+  $("#pricingMode").value = rule.mode;
+  $("#pricingValue").value = String(rule.value);
+  $("#autoPricingFormula").textContent = pricingFormula(rule, { compact: true });
+  updatePricingDraftHelp();
+  if (state.fx?.autoPricingValid === false) {
+    $("#pricingRuleHelp").textContent = "当前保存的自动定价规则无效，请重新选择模式、填写数值并保存。";
+  }
+  renderFxHealth(state.fx);
 }
 
 async function api(url, options = {}) {
@@ -540,13 +643,7 @@ async function loadProducts() {
 
 async function loadFx() {
   const data = await api("/api/admin/fx");
-  state.fx = data.fx || null;
-  const rate = Number(state.fx?.idrPerCny);
-  $("#statRate").textContent = Number.isFinite(rate) ? rate.toLocaleString("zh-CN", { maximumFractionDigits: 4 }) : "—";
-  $("#statRateTime").textContent = state.fx?.updatedAt ? formatDate(state.fx.updatedAt) : "等待汇率更新";
-  $("#manualFx").value = Number.isFinite(rate) ? String(rate) : "";
-  $("#fxSource").textContent = state.fx?.source === "manual" ? "后台手动设置" : (state.fx?.source || "—");
-  $("#fxUpdated").textContent = formatDate(state.fx?.updatedAt);
+  renderFxState(data.fx || null);
 }
 
 async function runProductSync() {
@@ -575,9 +672,12 @@ async function refreshFx() {
   const button = $("#refreshFx");
   setButtonBusy(button, true, "刷新中…");
   try {
-    await api("/api/admin/fx/refresh", { method: "POST", body: "{}" });
-    notify("汇率已刷新，自动售价已重新计算");
-    await Promise.all([loadFx(), loadProducts(), loadSystemStatus()]);
+    const result = await api("/api/admin/fx/refresh", { method: "POST", body: "{}" });
+    renderFxState(result.fx || null);
+    notify(result.fx?.rateChanged === false
+      ? "已重新获取汇率，但上游报价尚未变化"
+      : "汇率已更新，自动售价已重新计算");
+    await Promise.all([loadProducts(), loadSystemStatus(), loadAudit()]);
   } catch (error) {
     notify(error.message, "error");
   } finally {
@@ -600,6 +700,162 @@ async function bulkSetPublished(published) {
     notify(`批量${action}完成，更新 ${result.changed || 0} 项${skipped || missing ? `，跳过 ${skipped + missing} 项${firstSkippedReason ? `（${firstSkippedReason}）` : ""}` : ""}`);
     state.selectedSkus.clear();
     await loadProducts();
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function sortedServices(services = state.services) {
+  return [...services].sort((left, right) => {
+    const order = Number(left.sortOrder || 0) - Number(right.sortOrder || 0);
+    return order || String(left.title || "").localeCompare(String(right.title || ""), "zh-CN") || String(left.id || "").localeCompare(String(right.id || ""));
+  });
+}
+
+function serviceRow(service, draft = null) {
+  const view = draft ? { ...service, ...draft } : service;
+  return `<tr class="service-row" data-service-id="${escapeHtml(service.id)}">
+    <td><input class="table-input service-title-input" maxlength="40" value="${escapeHtml(view.title)}" aria-label="服务名称"></td>
+    <td><textarea class="table-input service-description-input" maxlength="240" rows="2" aria-label="服务说明">${escapeHtml(view.description || "")}</textarea></td>
+    <td><input class="table-input service-sort-input" type="number" min="0" max="1000000" step="1" inputmode="numeric" value="${escapeHtml(view.sortOrder ?? 0)}" aria-label="排序值"></td>
+    <td><label class="switch" title="控制是否在前台展示"><input class="service-enabled-input" type="checkbox" ${view.enabled !== false ? "checked" : ""}><span class="slider"></span></label><div class="subline">${view.enabled !== false ? "前台展示中" : "已停用"}</div></td>
+    <td><div class="service-row-actions"><button class="save-button save-service" type="button">保存</button><button class="mini-button danger delete-service" type="button">删除</button></div></td>
+  </tr>`;
+}
+
+function collectServiceDrafts() {
+  const drafts = new Map();
+  const baselines = new Map(state.services.map((service) => [String(service.id), service]));
+  $$(".service-row").forEach((row) => {
+    const id = String(row.dataset.serviceId || "");
+    if (!id) return;
+    const draft = {
+      title: $(".service-title-input", row)?.value ?? "",
+      description: $(".service-description-input", row)?.value ?? "",
+      sortOrder: $(".service-sort-input", row)?.value ?? "",
+      enabled: Boolean($(".service-enabled-input", row)?.checked)
+    };
+    const baseline = baselines.get(id);
+    const changed = !baseline
+      || draft.title !== String(baseline.title ?? "")
+      || draft.description !== String(baseline.description ?? "")
+      || draft.sortOrder !== String(baseline.sortOrder ?? 0)
+      || draft.enabled !== (baseline.enabled !== false);
+    if (changed) drafts.set(id, draft);
+  });
+  return drafts;
+}
+
+function renderServices(drafts = new Map()) {
+  const services = sortedServices();
+  $("#serviceCount").textContent = services.length.toLocaleString("zh-CN");
+  $("#serviceRows").innerHTML = services.length
+    ? services.map((service) => serviceRow(service, drafts.get(service.id))).join("")
+    : '<tr><td colspan="5" class="empty-state">暂无生活服务，可使用上方表单添加</td></tr>';
+}
+
+async function loadServices(showMessage = false, { preserveDrafts = !showMessage, excludeDraftIds = [] } = {}) {
+  const requestId = ++serviceLoadRequestId;
+  const data = await api("/api/admin/services");
+  if (requestId !== serviceLoadRequestId) return false;
+  const drafts = preserveDrafts ? collectServiceDrafts() : new Map();
+  excludeDraftIds.forEach((id) => drafts.delete(String(id)));
+  state.services = Array.isArray(data.services) ? data.services : [];
+  renderServices(drafts);
+  if (showMessage) notify("生活服务已刷新");
+  return true;
+}
+
+function readServiceRow(row) {
+  const title = $(".service-title-input", row).value.trim();
+  const description = $(".service-description-input", row).value.trim();
+  const rawSortOrder = $(".service-sort-input", row).value.trim();
+  const sortOrder = Number(rawSortOrder);
+  if (!title) throw new Error("服务名称不能为空");
+  if (title.length > 40) throw new Error("服务名称不能超过 40 个字符");
+  if (description.length > 240) throw new Error("服务说明不能超过 240 个字符");
+  if (!rawSortOrder || !Number.isSafeInteger(sortOrder) || sortOrder < 0 || sortOrder > 1_000_000) throw new Error("排序必须是 0–1,000,000 的整数");
+  return { title, description, sortOrder, enabled: $(".service-enabled-input", row).checked };
+}
+
+function changedServiceFields(id, payload) {
+  const baseline = state.services.find((service) => String(service.id) === String(id));
+  if (!baseline) throw new Error("服务资料已变化，请刷新后重试");
+  const changed = {};
+  if (payload.title !== baseline.title) changed.title = payload.title;
+  if (payload.description !== baseline.description) changed.description = payload.description;
+  if (payload.sortOrder !== baseline.sortOrder) changed.sortOrder = payload.sortOrder;
+  if (payload.enabled !== baseline.enabled) changed.enabled = payload.enabled;
+  return changed;
+}
+
+function setServiceRowBusy(row, busy) {
+  $$("input, textarea, button", row).forEach((element) => { element.disabled = busy; });
+}
+
+async function saveService(button) {
+  const row = button.closest(".service-row");
+  const id = row?.dataset.serviceId;
+  if (!id) return;
+  let payload;
+  try { payload = changedServiceFields(id, readServiceRow(row)); } catch (error) { return notify(error.message, "error"); }
+  if (!Object.keys(payload).length) return notify("没有需要保存的修改");
+  serviceLoadRequestId += 1;
+  setServiceRowBusy(row, true);
+  try {
+    await api(`/api/admin/services/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    notify(`${$(".service-title-input", row)?.value.trim() || "生活服务"} 已保存`);
+    await loadServices(false, { excludeDraftIds: [id] });
+    loadAudit().catch(() => {});
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    if (row.isConnected) setServiceRowBusy(row, false);
+  }
+}
+
+async function deleteService(button) {
+  const row = button.closest(".service-row");
+  const id = row?.dataset.serviceId;
+  const title = $(".service-title-input", row)?.value.trim() || "该服务";
+  if (!id || !window.confirm(`确定删除“${title}”吗？删除后前台将不再显示，且无法撤销。`)) return;
+  serviceLoadRequestId += 1;
+  setServiceRowBusy(row, true);
+  try {
+    await api(`/api/admin/services/${encodeURIComponent(id)}`, { method: "DELETE" });
+    notify(`${title} 已删除`);
+    await loadServices();
+    loadAudit().catch(() => {});
+  } catch (error) {
+    notify(error.message, "error");
+    if (row.isConnected) setServiceRowBusy(row, false);
+  }
+}
+
+async function createService(event) {
+  event.preventDefault();
+  const button = $("#createService");
+  const title = $("#serviceTitle").value.trim();
+  const description = $("#serviceDescription").value.trim();
+  const rawSortOrder = $("#serviceSortOrder").value.trim();
+  const sortOrder = Number(rawSortOrder);
+  if (!title) return notify("请输入服务名称", "error");
+  if (title.length > 40) return notify("服务名称不能超过 40 个字符", "error");
+  if (description.length > 240) return notify("服务说明不能超过 240 个字符", "error");
+  if (!rawSortOrder || !Number.isSafeInteger(sortOrder) || sortOrder < 0 || sortOrder > 1_000_000) return notify("排序必须是 0–1,000,000 的整数", "error");
+  const payload = { title, description, sortOrder, enabled: $("#serviceEnabled").checked };
+  serviceLoadRequestId += 1;
+  setButtonBusy(button, true, "添加中…");
+  try {
+    await api("/api/admin/services", { method: "POST", body: JSON.stringify(payload) });
+    await loadServices();
+    $("#serviceCreateForm").reset();
+    $("#serviceEnabled").checked = true;
+    $("#serviceSortOrder").value = String((Math.max(0, ...state.services.map((service) => Number(service.sortOrder) || 0)) + 10));
+    notify(`${title} 已添加`);
+    loadAudit().catch(() => {});
   } catch (error) {
     notify(error.message, "error");
   } finally {
@@ -681,6 +937,13 @@ function auditLabel(action) {
     "product.update": "修改商品设置",
     "fx.refresh": "刷新在线汇率",
     "fx.manual_update": "手动修改汇率",
+    "pricing.rule_update": "修改自动定价规则",
+    "service.create": "添加生活服务",
+    "service.update": "修改生活服务",
+    "service.delete": "删除生活服务",
+    "services.create": "添加生活服务",
+    "services.update": "修改生活服务",
+    "services.delete": "删除生活服务",
     "order.retry": "人工重新提交订单"
   })[action] || action || "后台操作";
 }
@@ -694,7 +957,12 @@ function summarizeAudit(details) {
   if (details.eligibleCount !== undefined) parts.push(`通信商品 ${details.eligibleCount} 项`);
   if (details.supplierCount !== undefined) parts.push(`供应商返回 ${details.supplierCount} 项`);
   if (details.idrPerCny !== undefined) parts.push(`汇率 ${details.idrPerCny}`);
+  if (details.rateChanged === false) parts.push("上游报价未变化");
+  if (details.mode === "fixed" && details.value !== undefined) parts.push(`固定加价 ${details.value} IDR`);
+  if (details.mode === "percent" && details.value !== undefined) parts.push(`比例加价 ${details.value}%`);
   if (details.orderId) parts.push(`订单 ${details.orderId}`);
+  if (details.serviceId) parts.push(`服务 ${details.serviceId}`);
+  if (details.title) parts.push(String(details.title));
   if (details.status) parts.push(`状态 ${details.status}`);
   if (details.published !== undefined) parts.push(details.published ? "已上架" : "未上架");
   return parts.length ? parts.join(" · ") : JSON.stringify(details);
@@ -718,12 +986,10 @@ async function loadSystemStatus() {
   $("#syncPages").textContent = sync.pages == null ? "—" : Number(sync.pages).toLocaleString("zh-CN");
   $("#syncCompleteness").textContent = syncCompleteness(sync).text;
   renderProductDiagnostics();
-  const foot = $(".sidebar-foot");
-  if (foot) foot.innerHTML = '<span class="health-dot"></span>生产服务运行中';
   if (status.fx) {
-    state.fx = status.fx;
-    $("#fxSource").textContent = status.fx.source === "manual" ? "后台手动设置" : (status.fx.source || "—");
-    $("#fxUpdated").textContent = formatDate(status.fx.updatedAt);
+    renderFxState(status.fx);
+  } else {
+    renderFxHealth(null);
   }
 }
 
@@ -748,16 +1014,40 @@ async function saveManualFx() {
   }
 }
 
+async function savePricingRule() {
+  const button = $("#savePricing");
+  const mode = $("#pricingMode").value === "percent" ? "percent" : "fixed";
+  const rawValue = $("#pricingValue").value.trim();
+  const value = Number(rawValue);
+  if (!rawValue || !Number.isFinite(value) || value < 0) return notify("请输入有效的非负加价值", "error");
+  if (mode === "fixed" && (!Number.isSafeInteger(value) || value > 1_000_000)) return notify("固定加价必须是 0–1,000,000 的整数 IDR", "error");
+  if (mode === "percent" && value > 1_000) return notify("比例加价必须是 0–1,000 的数字百分比", "error");
+  const rule = { mode, value };
+  if (!window.confirm(`确定保存“${mode === "fixed" ? `买入价 + ${value} IDR` : `买入价 + ${value}%`}”吗？这会立即影响所有自动定价商品，手动定价商品不变。`)) return;
+  setButtonBusy(button, true, "保存中…");
+  try {
+    const result = await api("/api/admin/pricing", { method: "PUT", body: JSON.stringify(rule) });
+    renderFxState(result.fx || state.fx);
+    notify("自动定价规则已保存，自动售价已重新计算");
+    await Promise.all([loadProducts(), loadSystemStatus(), loadAudit()]);
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
 async function switchSection(section) {
   state.section = section;
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.section === section));
   $$(".section").forEach((element) => element.classList.toggle("active", element.id === `section-${section}`));
-  const titles = { products: "商品中心", published: "上架商品", orders: "订单中心", system: "系统状态" };
+  const titles = { products: "商品中心", published: "上架商品", services: "生活服务", orders: "订单中心", system: "系统状态" };
   $("#pageTitle").textContent = titles[section] || "运营后台";
   closeMobileMenu();
   try {
     if (section === "orders") await loadOrders();
     if (section === "published") renderPublishedProducts();
+    if (section === "services") await loadServices();
     if (section === "system") await loadSystem();
   } catch (error) {
     notify(error.message, "error");
@@ -823,12 +1113,28 @@ function bindEvents() {
     try { await loadOrders(true); } catch (error) { notify(error.message, "error"); }
     finally { setButtonBusy(event.currentTarget, false); }
   });
+  $("#serviceCreateForm").addEventListener("submit", createService);
+  $("#refreshServices").addEventListener("click", async (event) => {
+    if (collectServiceDrafts().size && !window.confirm("刷新会放弃尚未保存的生活服务修改，是否继续？")) return;
+    setButtonBusy(event.currentTarget, true, "刷新中…");
+    try { await loadServices(true); } catch (error) { notify(error.message, "error"); }
+    finally { setButtonBusy(event.currentTarget, false); }
+  });
+  $("#serviceRows").addEventListener("click", (event) => {
+    const saveButton = event.target.closest(".save-service");
+    if (saveButton) return saveService(saveButton);
+    const deleteButton = event.target.closest(".delete-service");
+    if (deleteButton) deleteService(deleteButton);
+  });
   $("#refreshSystem").addEventListener("click", async (event) => {
     setButtonBusy(event.currentTarget, true, "刷新中…");
     try { await loadSystem(); notify("系统状态已刷新"); } catch (error) { notify(error.message, "error"); }
     finally { setButtonBusy(event.currentTarget, false); }
   });
   $("#saveFx").addEventListener("click", saveManualFx);
+  $("#savePricing").addEventListener("click", savePricingRule);
+  $("#pricingMode").addEventListener("change", updatePricingDraftHelp);
+  $("#pricingValue").addEventListener("input", updatePricingDraftHelp);
   $("#logout").addEventListener("click", logout);
   $("#menuButton").addEventListener("click", openMobileMenu);
   $("#mobileOverlay").addEventListener("click", closeMobileMenu);

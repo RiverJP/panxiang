@@ -10,7 +10,7 @@ const els = {
   summary: $("#catalog-summary"), loadMore: $("#load-more"), checkoutBar: $("#checkout-bar"),
   checkout: $("#checkout"), checkoutLabel: $("#checkout-label"), total: $("#total"),
   confirmSheet: $("#confirm-sheet"), confirmPay: $("#confirm-pay"), paymentMessage: $("#payment-message"),
-  ordersList: $("#orders-list"), orderDetail: $("#order-detail"), infoSheet: $("#info-sheet"),
+  ordersList: $("#orders-list"), orderDetail: $("#order-detail"), services: $("#life-services"), infoSheet: $("#info-sheet"),
   infoTitle: $("#info-title"), infoContent: $("#info-content"), toast: $("#toast")
 };
 
@@ -34,7 +34,7 @@ const statusMeta = {
   manual_review: ["人工处理中", "客服正在核查本订单", "progress"]
 };
 const terminalStatuses = new Set(["recharge_success", "refunded"]);
-const state = { products: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null, customerServiceUrl: "", publicConfigLoaded: false };
+const state = { products: [], services: [], selected: null, kind: "all", operator: "all", detectedOperator: null, visibleLimit: pageSize, route: "recharge", pollTimer: null, pollCount: 0, wechatAuthorized: false, accountOrderIds: new Set(), paymentFallbackOrderId: null, customerServiceUrl: "", publicConfigLoaded: false };
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -396,12 +396,45 @@ async function loadPublicConfig() {
   }
 }
 
+function renderLifeServices() {
+  if (!els.services) return;
+  if (!state.services.length) {
+    els.services.innerHTML = '<div class="empty-state service-empty">暂时没有可展示的生活服务，您仍可直接联系客服咨询。</div>';
+    return;
+  }
+  els.services.innerHTML = state.services.map((service, index) => `<button type="button" data-service-id="${escapeHtml(service.id)}">
+    <span class="service-icon">${String(index + 1).padStart(2, "0")}</span>
+    <span><strong>${escapeHtml(service.title)}</strong><small>${escapeHtml(service.description || "详细信息请联系客服")}</small></span><b>›</b>
+  </button>`).join("");
+}
+
+async function loadLifeServices() {
+  if (!els.services) return;
+  try {
+    const data = await fetchJson("/api/services");
+    state.services = (Array.isArray(data.services) ? data.services : []).filter((service) => service && service.enabled !== false && String(service.id || "").trim() && String(service.title || "").trim()).map((service) => ({
+      id: String(service.id).trim(),
+      title: String(service.title).trim(),
+      description: String(service.description || "").trim()
+    }));
+    renderLifeServices();
+  } catch {
+    state.services = [];
+    els.services.innerHTML = '<div class="empty-state service-empty">服务列表暂时无法加载，请稍后重试或直接联系客服。</div>';
+  }
+}
+
+let supportRequestId = 0;
 async function showSupport(service = "服务咨询") {
+  const requestId = ++supportRequestId;
+  const serviceInfo = service && typeof service === "object" ? service : { title: String(service || "服务咨询"), description: "" };
   await loadPublicConfig();
+  if (requestId !== supportRequestId) return;
   const contactAction = state.customerServiceUrl
     ? `<a class="support-action" href="${escapeHtml(state.customerServiceUrl)}">打开企业微信客服</a><p class="support-fallback">如果没有自动打开，请返回“盼享通”服务号，在对话框发送关键词 <strong>客服</strong>。</p>`
     : '<p>请关闭网页回到“盼享通”服务号，在对话框发送关键词 <strong>客服</strong>，并说明需要咨询的业务。</p>';
-  showInfo(service, `<h3>联系客服</h3>${contactAction}<h3>温馨提示</h3><p>办理条件、费用、周期及所需材料以客服最终确认为准，请勿提供支付密码、短信验证码等敏感信息。</p>`);
+  const description = serviceInfo.description ? `<p class="support-service-copy">${escapeHtml(serviceInfo.description)}</p>` : "";
+  showInfo(serviceInfo.title, `${description}<h3>联系客服</h3>${contactAction}<h3>温馨提示</h3><p>办理条件、费用、周期及所需材料以客服最终确认为准，请勿提供支付密码、短信验证码等敏感信息。</p>`);
 }
 
 async function updateIdentity() {
@@ -437,8 +470,11 @@ async function ensureWechatSession() {
 document.addEventListener("click", (event) => {
   const routeButton = event.target.closest("[data-route]");
   if (routeButton) setRoute(routeButton.dataset.route);
-  const supportButton = event.target.closest("[data-support]");
-  if (supportButton) showSupport(supportButton.dataset.support);
+  const serviceButton = event.target.closest("[data-service-id]");
+  if (serviceButton) {
+    const service = state.services.find((item) => item.id === serviceButton.dataset.serviceId);
+    if (service) showSupport(service);
+  }
   const infoButton = event.target.closest("[data-info]");
   if (infoButton?.dataset.info === "guide") showInfo("充值须知", "<h3>核对手机号</h3><p>提交前请确认号码和运营商正确，充值成功后通常无法撤回。</p><h3>到账时间</h3><p>支付成功不等于充值完成，请以订单详情中的最终状态为准。</p><h3>失败与退款</h3><p>未成功受理的订单将按系统状态进入退款或人工核查流程。</p>");
   if (infoButton?.dataset.info === "about") showInfo("关于盼享随充", "<p>盼享随充为在印度尼西亚生活或旅行的用户提供通信充值及生活服务咨询。</p><p>商品库存和到账结果以供应商及运营商处理结果为准。</p>");
@@ -465,5 +501,6 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape") { 
 const initialUrl = new URL(location.href);
 renderRoute(initialUrl.searchParams.get("view") || "recharge", initialUrl.searchParams.get("id"));
 loadCatalog();
+loadLifeServices();
 loadPublicConfig();
 ensureWechatSession();
