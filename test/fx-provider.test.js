@@ -4,6 +4,7 @@ import {
   FX_PROVIDERS,
   FxProviderError,
   fetchFxQuote,
+  parseBankOfChinaQuote,
   parseFxQuote,
   recommendedFxRefreshMinutes,
   selectFxProvider
@@ -15,6 +16,38 @@ const nextUpdate = Math.floor(Date.parse("2026-08-23T05:00:00.000Z") / 1000);
 
 function response(payload, { ok = true, status = 200 } = {}) {
   return { ok, status, json: async () => payload };
+}
+
+function htmlResponse(html, { ok = true, status = 200 } = {}) {
+  return { ok, status, text: async () => html };
+}
+
+function bankOfChinaHtml({
+  currency = "印尼卢比",
+  spotBuying = "0.0375",
+  cashBuying = "0.0375",
+  spotSelling = "0.0385",
+  cashSelling = "0.0385",
+  conversion = "0.0379",
+  quotedAt = "2026/08/24 00:00:05",
+  cells
+} = {}) {
+  const values = cells || [
+    currency,
+    spotBuying,
+    cashBuying,
+    spotSelling,
+    cashSelling,
+    conversion,
+    quotedAt,
+    ""
+  ];
+  return `<!doctype html>
+    <html><body><table>
+      <tr data-currency='${currency}'>
+        ${values.map((value) => `<td>${value}</td>`).join("")}
+      </tr>
+    </table></body></html>`;
 }
 
 function exchangeRateApiPayload(overrides = {}) {
@@ -49,8 +82,11 @@ function coinbasePayload(overrides = {}) {
   };
 }
 
-test("selects the keyed provider without exposing the key in configuration", () => {
-  const config = selectFxProvider({ EXCHANGE_RATE_API_KEY: "super-secret-key" });
+test("selects the keyed provider explicitly without exposing the key in configuration", () => {
+  const config = selectFxProvider({
+    FX_PROVIDER: "exchange-rate-api",
+    EXCHANGE_RATE_API_KEY: "super-secret-key"
+  });
   assert.deepEqual(config, {
     provider: FX_PROVIDERS.EXCHANGE_RATE_API,
     source: "ExchangeRate-API /v6/latest/CNY",
@@ -60,19 +96,104 @@ test("selects the keyed provider without exposing the key in configuration", () 
   assert.doesNotMatch(JSON.stringify(config), /super-secret-key/);
 });
 
-test("selects Coinbase current snapshots when no key is configured", () => {
+test("selects Bank of China by default in auto mode", () => {
   assert.deepEqual(selectFxProvider({}), {
-    provider: FX_PROVIDERS.COINBASE,
-    source: "Coinbase current snapshot",
+    provider: FX_PROVIDERS.BANK_OF_CHINA,
+    source: "中国银行外汇牌价·印尼卢比现汇卖出价",
     recommendedRefreshMinutes: 60,
     degraded: false
   });
+  assert.equal(selectFxProvider({
+    FX_PROVIDER: "auto",
+    EXCHANGE_RATE_API_KEY: "unused-key"
+  }).provider, FX_PROVIDERS.BANK_OF_CHINA);
+});
+
+test("fetches Bank of China HTML and converts the fourth-column spot selling quote", async () => {
+  const calls = [];
+  const quote = await fetchFxQuote({
+    env: {},
+    now: Date.parse("2026-08-24T00:30:00.000Z"),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return htmlResponse(bankOfChinaHtml());
+    }
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://www.boc.cn/sourcedb/whpj/");
+  assert.equal(calls[0].options.method, "GET");
+  assert.match(calls[0].options.headers.Accept, /^text\/html(?:,|$)/);
+  assert.deepEqual(quote, {
+    idrPerCny: 100 / 0.0385,
+    provider: FX_PROVIDERS.BANK_OF_CHINA,
+    source: "中国银行外汇牌价·印尼卢比现汇卖出价",
+    providerUpdatedAt: "2026-08-23T16:00:05.000Z",
+    providerNextUpdateAt: null,
+    fetchedAt: "2026-08-24T00:30:00.000Z",
+    recommendedRefreshMinutes: 60,
+    degraded: false
+  });
+  assert.notEqual(quote.idrPerCny, 100 / 0.0379);
+});
+
+test("strictly rejects missing or malformed Bank of China quote rows", () => {
+  const parse = (html) => parseBankOfChinaQuote(html, {
+    now: Date.parse("2026-08-24T00:30:00.000Z"),
+    env: {}
+  });
+  const cases = [
+    "",
+    "<html><table></table></html>",
+    bankOfChinaHtml({ currency: "美元" }),
+    bankOfChinaHtml({ cells: ["印尼卢比", "0.0375", "0.0375"] }),
+    bankOfChinaHtml({ spotSelling: "" }),
+    bankOfChinaHtml({ spotSelling: "not-a-number" }),
+    bankOfChinaHtml({ spotSelling: "0" }),
+    bankOfChinaHtml({ spotSelling: "0.000000001" }),
+    bankOfChinaHtml({ quotedAt: "not-a-time" }),
+    bankOfChinaHtml({ quotedAt: "2026/02/30 00:00:05" }),
+    bankOfChinaHtml({ quotedAt: "2026/08/24 08:36:00" })
+  ];
+
+  for (const html of cases) {
+    assert.throws(
+      () => parse(html),
+      (error) => error instanceof FxProviderError && error.code === "FX_PARSE_ERROR"
+    );
+  }
+});
+
+test("rejects Bank of China HTTP errors without attempting to parse the body", async () => {
+  let textWasRead = false;
+  await assert.rejects(
+    fetchFxQuote({
+      env: {},
+      now,
+      fetchImpl: async () => ({
+        ok: false,
+        status: 503,
+        text: async () => {
+          textWasRead = true;
+          return bankOfChinaHtml();
+        }
+      })
+    }),
+    (error) => error instanceof FxProviderError
+      && error.code === "FX_HTTP_ERROR"
+      && error.status === 503
+      && error.provider === FX_PROVIDERS.BANK_OF_CHINA
+  );
+  assert.equal(textWasRead, false);
 });
 
 test("fetches and normalizes a keyless Coinbase current snapshot", async () => {
   const calls = [];
   const quote = await fetchFxQuote({
-    env: { COINBASE_REFRESH_MINUTES: "15" },
+    env: {
+      FX_PROVIDER: "coinbase",
+      COINBASE_REFRESH_MINUTES: "15"
+    },
     now,
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
@@ -98,6 +219,7 @@ test("fetches and normalizes a keyless Coinbase current snapshot", async () => {
 test("fetches and normalizes a keyed ExchangeRate-API quote", async () => {
   const calls = [];
   const env = {
+    FX_PROVIDER: "exchange-rate-api",
     EXCHANGE_RATE_API_KEY: "secret/key",
     EXCHANGE_RATE_API_REFRESH_MINUTES: "30"
   };
@@ -224,7 +346,10 @@ test("rejects a last-update timestamp too far in the future", () => {
 test("sanitizes transport errors so a secret-bearing URL is not exposed", async () => {
   await assert.rejects(
     fetchFxQuote({
-      env: { EXCHANGE_RATE_API_KEY: "must-not-leak" },
+      env: {
+        FX_PROVIDER: "exchange-rate-api",
+        EXCHANGE_RATE_API_KEY: "must-not-leak"
+      },
       now,
       fetchImpl: async (url) => {
         throw new Error(`request failed: ${url}`);
@@ -242,6 +367,7 @@ test("rejects non-HTTPS endpoint overrides", async () => {
   await assert.rejects(
     fetchFxQuote({
       env: {
+        FX_PROVIDER: "exchange-rate-api",
         EXCHANGE_RATE_API_KEY: "key",
         EXCHANGE_RATE_API_BASE_URL: "http://rates.example.test/v6"
       },
@@ -255,9 +381,23 @@ test("rejects non-HTTPS endpoint overrides", async () => {
 test("rejects non-HTTPS Coinbase endpoint overrides", async () => {
   await assert.rejects(
     fetchFxQuote({
-      env: { COINBASE_EXCHANGE_RATE_URL: "http://rates.example.test/v2/exchange-rates" },
+      env: {
+        FX_PROVIDER: "coinbase",
+        COINBASE_EXCHANGE_RATE_URL: "http://rates.example.test/v2/exchange-rates"
+      },
       now,
       fetchImpl: async () => response(coinbasePayload())
+    }),
+    (error) => error instanceof FxProviderError && error.code === "FX_CONFIG_ERROR"
+  );
+});
+
+test("rejects non-HTTPS Bank of China endpoint overrides", async () => {
+  await assert.rejects(
+    fetchFxQuote({
+      env: { BOC_FX_URL: "http://rates.example.test/boc" },
+      now,
+      fetchImpl: async () => htmlResponse(bankOfChinaHtml())
     }),
     (error) => error instanceof FxProviderError && error.code === "FX_CONFIG_ERROR"
   );

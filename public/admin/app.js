@@ -92,8 +92,10 @@ function updatePricingDraftHelp() {
 
 function formatFxSource(source) {
   if (source === "manual") return "后台手动设置";
-  if (String(source || "").toLowerCase().includes("coinbase")) return "Coinbase 当前汇率快照";
-  if (String(source || "").includes("open.er-api.com")) return "ExchangeRate-API 免费行情";
+  const normalized = String(source || "").toLowerCase();
+  if (normalized.includes("bank-of-china") || normalized.includes("boc.cn")) return "中国银行外汇牌价·印尼卢比现汇卖出价";
+  if (normalized.includes("coinbase")) return "Coinbase 当前汇率快照";
+  if (normalized.includes("open.er-api.com")) return "ExchangeRate-API 免费行情";
   return source || "—";
 }
 
